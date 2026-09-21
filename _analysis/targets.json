@@ -1,0 +1,33 @@
+{
+  "pages": {"txs": 25, "tt": 25, "itx": 12, "holders": 15, "transfers": 30, "token_txs": 30},
+  "contracts": {
+    "escrow": "0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e",
+    "hook": "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044",
+    "gaslitedrop": "0xE68d0bbc023de3fEBdA04f413db23cE9C5EA1934"
+  },
+  "wallets": [
+    "0x6ecd4ff6ca25a6d71236d6ad66cbd86c25d4055f",
+    "0x66a74d2ae8233d468fd713cec3093979e4e0d524",
+    "0xd657f31472cc4f84fccda7b19cfc8f930b168661",
+    "0xe3694eb11403ec6fe104a58a756c665328d3f630",
+    "0xe1f2c86eb7882c6ea8d1f813d3f9474b2e180d48",
+    "0x26742a362f67298d820cea2a5e661248a5c2dd7e",
+    "0xfa7a71f662810594231713dcbc734e6e99c13a6f",
+    "0x0ca689ec5898b1bcbd0aec0d28490732f0cf7528",
+    "0xcee7cb1aacc8c494cb47a70b862390651c470b8b",
+    "0x8d11cb69f6bed6bfe9f0e8012820874070e201e6",
+    "0xcc5dd3e55c1a3f5439d175de78132c020c9652c7",
+    "0x382e8791f0a209d4da04db98d07ca3b76dcc5706",
+    "0x5909eeff6ac40b33ac7b088602e05edf591223ac",
+    "0xe27501d787d647cc82a5b4a7eafd5750386f1b77",
+    "0xf5626688491b8d36b386dc30dd9370b23c72bd49"
+  ],
+  "tokens": [
+    {"token": "0x8D11cB69F6beD6BFE9f0E8012820874070E201E6", "creator": "0x6ecd4ff6ca25a6d71236d6ad66cbd86c25d4055f", "claimer": "0x6ecd4ff6ca25a6d71236d6ad66cbd86c25d4055f"},
+    {"token": "0xcc5dd3e55c1a3f5439d175de78132c020c9652c7", "creator": "0x66a74d2ae8233d468fd713cec3093979e4e0d524", "claimer": "0x66a74d2ae8233d468fd713cec3093979e4e0d524"},
+    {"token": "0x382e8791f0a209d4da04db98d07ca3b76dcc5706", "creator": "0xd657f31472cc4f84fccda7b19cfc8f930b168661", "claimer": "0xe3694eb11403ec6fe104a58a756c665328d3f630"},
+    {"token": "0x5909eeff6ac40b33ac7b088602e05edf591223ac", "creator": "0xe1f2c86eb7882c6ea8d1f813d3f9474b2e180d48", "claimer": "0x26742a362f67298d820cea2a5e661248a5c2dd7e"},
+    {"token": "0xe27501d787d647cc82a5b4a7eafd5750386f1b77", "creator": "0xfa7a71f662810594231713dcbc734e6e99c13a6f", "claimer": "0x0ca689ec5898b1bcbd0aec0d28490732f0cf7528"},
+    {"token": "0xf5626688491b8d36b386dc30dd9370b23c72bd49", "creator": "0xcee7cb1aacc8c494cb47a70b862390651c470b8b", "claimer": "0xcee7cb1aacc8c494cb47a70b862390651c470b8b"}
+  ]
+}

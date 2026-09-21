@@ -2,10 +2,13 @@
  "pages": {
   "txs": 25,
   "tt": 25,
-  "itx": 12,
-  "holders": 25,
-  "transfers": 40,
-  "token_txs": 40
+  "itx": 25,
+  "holders": 12,
+  "transfers": 60,
+  "token_txs": 30,
+  "watch_txs": 4,
+  "watch_tt": 4,
+  "watch_itx": 2
  },
  "contracts": {
   "escrow": "0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e",
@@ -54,5 +57,22 @@
    "creator": "0xcee7cb1aacc8c494cb47a70b862390651c470b8b",
    "claimer": "0xcee7cb1aacc8c494cb47a70b862390651c470b8b"
   }
+ ],
+ "order": [
+  "tokens",
+  "wallets",
+  "contracts",
+  "watch"
+ ],
+ "watch": [
+  "0xb0eEb6ECb62b044E926451cB432c403Ea315Ac34",
+  "0x4c1f9364dEb64C7b12810D80319fD0A58148FCD5",
+  "0xF0c96cE48b042A85C4E16bceA0d56Bf3a70F5d2b",
+  "0x7ae604D88326A538Ab52a78DA0303410d45d5bcC",
+  "0x77FB0a75354b298C4a1AfCc2717C1e0A022DDD9e",
+  "0x8e6294a960Ede9AfA849Eb011cAE4146715b23C4",
+  "0x2B9C308f8cF178c3982A1F8bAB045c187367f83B",
+  "0x9B7a20FfE1c15Af79d2D4D2C9E305dADB964E380",
+  "0xA72A41Fa908C84f320B0d8B54833d1B1D2fdE0f6"
  ]
 }

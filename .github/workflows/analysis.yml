@@ -6,7 +6,7 @@ on:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     permissions:
       contents: write
     steps:
@@ -14,7 +14,9 @@ jobs:
       - name: fetch data
         continue-on-error: true
         env:
-          DEADLINE_SECONDS: '1200'
+          DEADLINE_SECONDS: '2700'
+          MAX_RPS: '2.5'
+          WORKERS: '3'
         run: python3 _analysis/fetch3.py 2>&1 | tee _analysis/run.log | tail -140
       - name: pack + index
         if: always()

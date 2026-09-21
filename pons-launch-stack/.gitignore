@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.local
+wallets-out/
+launches/*.json
+!launches/.gitkeep

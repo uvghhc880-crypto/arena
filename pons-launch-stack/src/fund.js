@@ -1,8 +1,13 @@
 // عملیات خزانه/ولت‌ها: تولید ولت‌ها از نمونیک، شارژ گس اولیه، مانده‌خوانی، پس‌گیری (sweep)
 import fs from "node:fs";
-import { Wallet } from "ethers";
+import { Wallet, isAddress } from "ethers";
 import { WALLETS_OUT, env, parseArgs } from "./config.js";
-import { provider, masterWallet, deriveWorkers, workerStart, eth, fmt, gasPrice, splitRandom, sleep, nowTag } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, eth, fmt, gasPrice, splitRandom, sleep, nowTag } from "./lib.js";
+
+// ژورنال شارژ: جلوگیری از شارژ دوباره‌ی همان ولت بعد از قطع‌شدن اجرا (--force = شارژ دوباره)
+const FUND_JOURNAL = `${WALLETS_OUT}/fund_journal.json`;
+function readJournal() { try { return JSON.parse(fs.readFileSync(FUND_JOURNAL, "utf8")); } catch { return {}; } }
+function writeJournal(j) { fs.writeFileSync(FUND_JOURNAL, JSON.stringify(j, null, 2)); }
 
 async function main() {
   const a = parseArgs();
@@ -35,7 +40,9 @@ async function main() {
     const shares = splitRandom(total, workers.length);
     const master = masterWallet();
     const gp = await gasPrice();
-    console.log(`💸 شارژ گس ${workers.length} ولت با مجموع ${total} ETH از مستر`);
+    const force = truthy(a.force);
+    const journal = readJournal();
+    console.log(`💸 شارژ گس ${workers.length} ولت با مجموع ${total} ETH از مستر${force ? " (--force: شارژ دوباره‌ی ژورنال‌شده‌ها)" : ""}`);
     const bal = await provider.getBalance(master.address);
     if (bal < eth(total + 0.005)) {
       console.log(`⛔ موجودی مستر کافی نیست: ${fmt(bal)} ETH < ${total + 0.005} ETH`);
@@ -43,9 +50,15 @@ async function main() {
     }
     for (let i = 0; i < workers.length; i++) {
       const w = workers[i];
+      if (journal[w.address] && !force) {
+        console.log(`   ⏭️ ${w.address}: قبلاً در ژورنال شارژ شده (${journal[w.address].valueEth} ETH) — رد شد`);
+        continue;
+      }
       const value = eth(shares[i].toFixed(6));
       const tx = await master.sendTransaction({ to: w.address, value, gasPrice: gp });
-      await tx.wait();
+      await tx.wait(1, 120000);
+      journal[w.address] = { valueEth: shares[i].toFixed(6), tx: tx.hash, at: new Date().toISOString() };
+      writeJournal(journal); // ژورنال بعد از هر ارسال — ضد کرش
       console.log(`   ✅ ${w.address}: ${fmt(value)} ETH (${tx.hash})`);
       await sleep(200);
     }
@@ -66,9 +79,10 @@ async function main() {
 
   if (cmd === "sweep") {
     const treasury = env("TREASURY_ADDRESS");
-    if (!treasury) { console.log("TREASURY_ADDRESS را در .env بگذار"); process.exit(1); }
+    if (!treasury || !isAddress(treasury)) { console.log("⛔ TREASURY_ADDRESS نامعتبر است — یک آدرس معتبر (EOA) در .env بگذار"); process.exit(1); }
     const workers = deriveWorkers(Number(a.workers ?? env("WORKER_COUNT", "28")), workerStart(a));
     const keepReserve = BigInt(a.reserve ?? "50000000000000"); // 0.00005 ETH
+    // توجه: هزینه گس ۲۱۰۰۰ برای خزانه‌ی EOA کافی است؛ اگر خزانه قرارداد است --reserve بزرگ‌تر بده
     for (const w of workers) {
       const bal = await provider.getBalance(w.address);
       if (bal <= keepReserve) continue;
@@ -77,7 +91,7 @@ async function main() {
       const value = bal - keepReserve - gasCost;
       if (value <= 0n) continue;
       const tx = await w.wallet.sendTransaction({ to: treasury, value, gasPrice: gp });
-      await tx.wait();
+      await tx.wait(1, 120000);
       console.log(`   💰 ${w.address} → خزانه: ${fmt(value)} ETH (${tx.hash})`);
       await sleep(200);
     }

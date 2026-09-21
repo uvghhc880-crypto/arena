@@ -5,9 +5,10 @@
 import { Contract, ethers, formatUnits } from "ethers";
 import { ADDR, env, parseArgs } from "./config.js";
 import { ERC20_ABI, UNIVERSAL_ROUTER_ABI, BONDING_CURVE_ABI } from "./abis.js";
-import { masterWallet, deriveWorkers, workerStart, fmt, gasPrice, rand, sleep, provider } from "./lib.js";
+import { masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, rand, sleep, provider } from "./lib.js";
+import { marketPrice, estMinOut } from "./market.js";
 
-// توزیع پله‌ها: پیش‌فرض فارم = تدریجی محافظه‌کار
+// توزیع پله‌ها: پیش‌فرض فارم = تدریجی محافظه‌کار (جمع همیشه ۱۰۰)
 function ladder(mode) {
   if (mode === "aggressive") return [45, 45, 10];
   if (mode === "micro") return [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10];
@@ -18,12 +19,13 @@ async function main() {
   const a = parseArgs();
   const tokenAddr = a.token;
   const mode = a.mode ?? "gradual"; // gradual | aggressive | micro
-  const source = a["from-workers"] ? "workers" : a["from-master"] ? "master" : "workers";
-  const targetPct = Number(a["pct-of-balance"] ?? "100");
+  const source = truthy(a["from-workers"]) || !truthy(a["from-master"]) ? "workers" : "master";
+  const targetPct = numOpt(a["pct-of-balance"], 100, { min: 1, max: 100, name: "pct-of-balance" });
   const delayMin = Number(a["delay-min"] ?? 15000);
   const delayMax = Number(a["delay-max"] ?? 60000);
   const curve = a.curve;
   const urData = a["ur-data"];
+  const slippageBps = numOpt(a["slippage-bps"], Number(env("SLIPPAGE_BPS", "800")), { min: 0, max: 5000, name: "slippage-bps" });
 
   if (!tokenAddr) { console.log("لازم: --token 0x.."); process.exit(1); }
 
@@ -37,7 +39,18 @@ async function main() {
   const gp = await gasPrice();
   const steps = ladder(mode);
 
-  console.log(`📉 فروش پله‌ای (${mode}): ${steps.join("% ، ")}% | ولت‌های فروشنده: ${sellers.length}`);
+  // قیمت مرجع برای minOut فروش (آخرین معاملات کرو) — اگر در دسترس نبود، 0 + هشدار
+  let estPrice = null;
+  if (curve && !urData) {
+    try {
+      const latest = await provider.getBlockNumber();
+      const mp = await marketPrice(curve, Math.max(0, latest - 2000), 5);
+      estPrice = mp?.price ?? null;
+    } catch {}
+    if (!estPrice) console.warn("⚠️ قیمت مرجع برای minOut پیدا نشد — فروش با minQuoteOut=0 انجام می‌شود!");
+  }
+
+  console.log(`📉 فروش پله‌ای (${mode}): ${steps.join("% ، ")}% | ولت‌های فروشنده: ${sellers.length} | لغزش مجاز: ${slippageBps / 100}٪`);
 
   for (const s of sellers) {
     const bal = await token.balanceOf(s.address);
@@ -45,35 +58,42 @@ async function main() {
     if (toSell === 0n) { console.log(`— ${s.address}: بدون موجودی`); continue; }
     console.log(`\n🟠 ${s.address} | موجودی: ${formatUnits(bal, decimals)} | برنامه: ${targetPct}% از آن`);
 
+    let remaining = toSell;
     for (let i = 0; i < steps.length; i++) {
-      const stepAmt = i === steps.length - 1 ? toSell : (toSell * BigInt(steps[i])) / 100n;
+      // پله‌ی آخر = «باقی‌مانده‌ی واقعی» (رفع باگ فروش بیش‌از‌موجودی)؛ میانی‌ها = سهم نردبان از کل
+      const stepAmt = i === steps.length - 1 ? remaining : (toSell * BigInt(steps[i])) / 100n;
       if (stepAmt === 0n) continue;
       const tw = token.connect(s.wallet); // ethers v6: Contract.connect(signer)
       try {
         let tx;
         if (curve && !urData) {
-          // مسیر ۱: sell مستقیم روی کرو (امضای واقعیش را داریم)
-          await (await tw.approve(curve, stepAmt)).wait();
+          // مسیر ۱: sell مستقیم روی کرو (امضای واقعیش را داریم) — با minQuoteOut تخمینی
+          const minOut = estMinOut(stepAmt, estPrice, slippageBps);
+          await (await tw.approve(curve, stepAmt)).wait(1, 120000);
           const cr = new Contract(curve, BONDING_CURVE_ABI, s.wallet);
           // شبیه‌سازی قبل از ارسال — ریورت را قبل از سوخت گس پیدا می‌کند
-          const data = cr.interface.encodeFunctionData("sell", [stepAmt, 0n, s.address]);
+          const data = cr.interface.encodeFunctionData("sell", [stepAmt, minOut, s.address]);
           await provider.call({ to: curve, data, from: s.wallet.address });
-          tx = await cr.sell(stepAmt, 0, s.address, { gasPrice: gp });
+          tx = await cr.sell(stepAmt, minOut, s.address, { gasPrice: gp });
         } else if (urData) {
           // مسیر ۲: UniversalRouter با دیتای آماده (دیتا باید minOut خودش را داشته باشد)
-          await (await tw.approve(ADDR.UNIVERSAL_ROUTER, stepAmt)).wait();
+          await (await tw.approve(ADDR.UNIVERSAL_ROUTER, stepAmt)).wait(1, 120000);
+          const data = router.interface.encodeFunctionData("execute(bytes,bytes[],uint256)", ["0x00", [ethers.getBytes(urData)], Math.floor(Date.now() / 1000) + 300]);
+          await provider.call({ to: ADDR.UNIVERSAL_ROUTER, data, from: s.wallet.address }); // شبیه‌سازی
           tx = await router.connect(s.wallet).execute("0x00", [ethers.getBytes(urData)], Math.floor(Date.now() / 1000) + 300, { gasPrice: gp });
         } else {
           throw new Error("نه --curve داده‌ای و نه --ur-data؛ حداقل یکی لازم است");
         }
-        await tx.wait();
+        await tx.wait(1, 120000);
+        remaining -= stepAmt;
         console.log(`   ✅ پله ${i + 1}/${steps.length} (${steps[i]}%) فروخته شد: ${tx.hash}`);
         if (i < steps.length - 1) await sleep(rand(delayMin, delayMax));
       } catch (e) {
-        console.log(`   ❌ شکست پله ${i + 1}:`, e.shortMessage ?? e.message);
+        console.log(`   ❌ شکست پله ${i + 1}:`, (e.shortMessage ?? e.message).slice(0, 120));
         break;
       }
     }
+    if (remaining > 0n) console.log(`   ↩︎ باقی‌مانده‌ی فروخته‌نشده این ولت: ${formatUnits(remaining, decimals)}`);
   }
   console.log("\n✔️ فروش تمام شد.");
 }

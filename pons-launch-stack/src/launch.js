@@ -4,9 +4,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Contract, ethers } from "ethers";
-import { ADDR, LAUNCHES_DIR, env, parseArgs } from "./config.js";
+import { ADDR, CHAIN, LAUNCHES_DIR, env, parseArgs } from "./config.js";
 import { LAUNCH_AND_BUY_ABI } from "./abis.js";
-import { masterWallet, claimerWallet, deriveWorkers, workerStart, eth, fmt, nowTag } from "./lib.js";
+import { masterWallet, claimerWallet, deriveWorkers, workerStart, truthy, eth, fmt, nowTag, provider, normalizeBytes32 } from "./lib.js";
 
 const FACTORY_V2_ABI = [
   "function launchToken((string name, string symbol, string logo, string description, (string twitter, string telegram, string discord, string website, string farcaster) socials, address creatorFeeRecipient, uint16 creatorTaxBps, bool buybackEnabled, bytes32 expectedEconomics, bytes32 salt) params, address pairToken, address factoryRef) payable",
@@ -14,6 +14,9 @@ const FACTORY_V2_ABI = [
 
 // مقدار ۳۲بایتی «پوچ» مشاهده‌شده در تمام لانچ‌های ساندیگ شده
 const ZERO32 = "0x" + "0".repeat(64);
+
+// پاک‌سازی رشته برای نام فایل (جلوگیری از path traversal مثل ../../)
+const safeName = (s) => String(s).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "TOKEN";
 
 function pairTokenFromArgs(a) {
   if (a["pair-token"]) return a["pair-token"];
@@ -24,7 +27,8 @@ function pairTokenFromArgs(a) {
 async function main() {
   const a = parseArgs();
   if (a.dry === "factory") {
-    // --dry factory : حالت تست‌سر — لانچ مستقیم از فکتوری با فی برگشتی، بدون خرید اول (الگوی روش B فارم)
+    // --dry factory : حالت تست‌سر — نام فلگ تاریخی است؛ این مسیر تراکنش «واقعی» می‌فرستد!
+    console.warn("🧨 توجه: --dry factory با وجود نامش، یک لانچ واقعی روی مین‌نت ارسال می‌کند (حالت تست‌سر فارم).");
     return dryFactoryLaunch(a);
   }
 
@@ -57,6 +61,14 @@ async function main() {
 
   const minOut = a["min-out"] ? BigInt(a["min-out"]) : 0n;
 
+  // salt: هگز (هر طولی) → zeroPad به ۳۲ بایت؛ عدد → تبدیل به ۳۲ بایت
+  let salt = ethers.ZeroHash;
+  if (a.salt) {
+    salt = a.salt.startsWith("0x")
+      ? normalizeBytes32(a.salt)                                   // هگز — طول فرد هم امن
+      : normalizeBytes32("0x" + BigInt(a.salt).toString(16));      // عدد صحیح
+  }
+
   const params = {
     name,
     symbol,
@@ -73,7 +85,7 @@ async function main() {
     creatorTaxBps: Number(a["creator-tax-bps"] ?? 0),
     buybackEnabled: false,
     expectedEconomics: env("EXPECTED_ECONOMICS", ZERO32),
-    salt: a.salt ? (a.salt.startsWith("0x") ? a.salt : ethers.zeroPadValue(ethers.toBeArray(BigInt(a.salt)), 32)) : ethers.ZeroHash,
+    salt,
   };
 
   const pairToken = pairTokenFromArgs(a);
@@ -82,18 +94,31 @@ async function main() {
     console.warn("⚠️ launchConfigId صفر فرض شد — اگر LaunchEconomicsMismatch دیدی مقدار درست را در .env بگذار.");
   }
 
-  // ولیو تراکنش = فی لانچ + مبلغ خرید اول — فی از «فکتوری» خوانده می‌شود (launchFee روی LaunchAndBuy
-  // در ABI ما نیست؛ فکتوری منبع معتبر است)، در غیر این صورت fallback:
-  let launchFee;
+  // ولیو تراکنش = فی لانچ + مبلغ خرید اول — فی از «فکتوری» خوانده می‌شود؛ env فقط با --force-fee-env
+  let launchFee = null;
+  let onchainFee = null;
   try {
     const factoryRead = new Contract(ADDR.LAUNCH_FACTORY_V2, ["function launchFee() view returns (uint256)"], master);
-    launchFee = await factoryRead.launchFee();
+    onchainFee = await factoryRead.launchFee();
+    launchFee = onchainFee;
     console.log(`ℹ️ فی لانچ آنچین (فکتوری): ${fmt(launchFee)} ETH`);
   } catch {
     launchFee = eth(env("LAUNCH_FEE_ETH", "0.0005"));
     console.log(`ℹ️ فی لانچ fallback: ${fmt(launchFee)} ETH`);
   }
-  if (env("LAUNCH_FEE_ETH")) launchFee = eth(env("LAUNCH_FEE_ETH"));
+  if (env("LAUNCH_FEE_ETH")) {
+    const envFee = eth(env("LAUNCH_FEE_ETH"));
+    if (onchainFee !== null && envFee !== onchainFee) {
+      if (truthy(a["force-fee-env"])) {
+        launchFee = envFee;
+        console.warn(`⚠️ override اجباری فی: env=${fmt(envFee)} به‌جای آنچین=${fmt(onchainFee)}`);
+      } else {
+        console.warn(`⚠️ LAUNCH_FEE_ETH در env (${fmt(envFee)}) با فی آنچین (${fmt(onchainFee)}) فرق دارد — آنچین استفاده شد. برای اجبار: --force-fee-env`);
+      }
+    } else if (onchainFee === null) {
+      launchFee = envFee;
+    }
+  }
 
   const value = launchFee + eth(quoteEth);
 
@@ -101,6 +126,16 @@ async function main() {
   console.log(`   creator: ${master.address}`);
   console.log(`   feeRecipient (claimer): ${feeRecipient}`);
   if (exemptN > 0) console.log(`   ولت‌های معاف (${exemptN} ولت، از ایندکس ${exemptStart}): ${snipeTaxExemptions.join(", ")}`);
+
+  // شبیه‌سازی کامل قبل از ارسال — اگر ریورت کند، ETH از دست نمی‌رود
+  const callData = lab.interface.encodeFunctionData("launchAndBuy", [params, launchConfigId, pairToken, eth(quoteEth), minOut, master.address, snipeTaxExemptions]);
+  try {
+    await provider.call({ to: ADDR.LAUNCH_AND_BUY, data: callData, value, from: master.address });
+    console.log("🧪 شبیه‌سازی لانچ: OK");
+  } catch (e) {
+    console.log("⛔ شبیه‌سازی لانچ ریورت شد — هیچ تراکنشی ارسال نشد:", (e.shortMessage ?? e.message).slice(0, 160));
+    process.exit(1);
+  }
 
   const tx = await lab.launchAndBuy(
     params,
@@ -114,9 +149,12 @@ async function main() {
   );
   console.log("tx:", tx.hash);
   const rc = await tx.wait();
+  if (rc.status !== 1) {
+    console.log("⛔ تراکنش لانچ ریورت شد (status=0) — رکورد با token=null ذخیره می‌شود");
+  }
 
-  // استخراج آدرس توکن/کرو از ایونت Launched
-  let tokenAddr, curveAddr, tokensOut;
+  // استخراج آدرس توکن/کرو فقط از ایونت Launched — بدون حدس از logs[0] (حدس می‌تواند آدرس اشتباه ذخیره کند!)
+  let tokenAddr = null, curveAddr = null, tokensOut = null;
   const iface = lab.interface;
   for (const log of rc.logs) {
     try {
@@ -128,19 +166,21 @@ async function main() {
       }
     } catch {}
   }
-  if (!tokenAddr) tokenAddr = rc.logs[0]?.address;
+  if (!tokenAddr) console.warn("⚠️ ایونت Launched پیدا نشد — token/curve در رکورد null است؛ از Blockscout دستی بخوان و در رکورد بنویس");
 
   const record = {
     name, symbol, txHash: tx.hash,
     token: tokenAddr ?? null, curve: curveAddr ?? null,
     creator: master.address, feeRecipient,
     quoteIn: quoteEth, exemptions: snipeTaxExemptions, workerStart: exemptStart,
+    chainId: CHAIN.id, launchConfigId, launchFeeWei: launchFee.toString(),
+    receiptStatus: rc.status, blockNumber: rc.blockNumber,
     createdAt: new Date().toISOString(),
   };
-  const file = path.join(LAUNCHES_DIR, `launch_${nowTag()}_${symbol}.json`);
+  const file = path.join(LAUNCHES_DIR, `launch_${nowTag()}_${safeName(symbol)}.json`);
   fs.writeFileSync(file, JSON.stringify(record, null, 2));
-  console.log("🎉 لانچ موفق:", tokenAddr ? `token=${tokenAddr} curve=${curveAddr ?? "?"} tokensOut=${tokensOut ? tokensOut.toString() : "?"}` : "آدرس توکن از ایونت استخراج نشد — دستی چک کن");
-  console.log("📄 رکورد:", file, JSON.stringify(record, null, 2));
+  console.log("🎉 پایان لانچ:", tokenAddr ? `token=${tokenAddr} curve=${curveAddr ?? "?"} tokensOut=${tokensOut ? tokensOut.toString() : "?"}` : "آدرس توکن null (رکورد را دستی تکمیل کن)");
+  console.log("📄 رکورد:", file);
 }
 
 async function dryFactoryLaunch(a) {
@@ -159,6 +199,15 @@ async function dryFactoryLaunch(a) {
   };
   const fee = eth(env("LAUNCH_FEE_ETH", "0.0005"));
   console.log(`🧪 لانچ خشک فکتوری (بدون خرید اول) ${symbol} روی ${ADDR.LAUNCH_FACTORY_V2}`);
+  // شبیه‌سازی قبل از ارسال واقعی
+  const data = factory.interface.encodeFunctionData("launchToken", [params, ethers.ZeroAddress, master.address]);
+  try {
+    await provider.call({ to: ADDR.LAUNCH_FACTORY_V2, data, value: fee, from: master.address });
+    console.log("🧪 شبیه‌سازی: OK");
+  } catch (e) {
+    console.log("⛔ شبیه‌سازی ریورت شد — ارسال نشد:", (e.shortMessage ?? e.message).slice(0, 160));
+    process.exit(1);
+  }
   const tx = await factory.launchToken(params, ethers.ZeroAddress, master.address, { value: fee });
   console.log("tx:", tx.hash);
   const rc = await tx.wait();

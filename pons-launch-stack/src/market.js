@@ -1,6 +1,6 @@
 // کمکی‌های مشترک «بازار» کرو: خواندن معاملات رویدادی، قیمت میانه‌ی آخرین معاملات،
 // و خروج اضطراری موازی (همان motor پنیک — کریتور + باندل‌ها در چانک‌های هم‌زمان)
-import { Contract, Interface } from "ethers";
+import { Contract, Interface, formatUnits } from "ethers";
 import { BONDING_CURVE_ABI, ERC20_ABI } from "./abis.js";
 import { provider, fmt } from "./lib.js";
 
@@ -18,17 +18,19 @@ export async function curveTrades(curveAddr, fromBlock) {
     toBlock: "latest",
   });
   const out = [];
+  let skipped = 0;
   for (const lg of logs) {
     try {
       const ev = curveIface.parseLog({ topics: lg.topics, data: lg.data });
-      if (!ev) continue;
+      if (!ev) { skipped++; continue; }
       if (ev.name === "CurveBuy") {
         out.push({ type: "buy", who: ev.args.recipient.toLowerCase(), actor: ev.args.buyer.toLowerCase(), quote: BigInt(ev.args.quoteIn), tokens: BigInt(ev.args.tokensOut), block: lg.blockNumber, tx: lg.transactionHash });
       } else if (ev.name === "CurveSell") {
         out.push({ type: "sell", who: ev.args.seller.toLowerCase(), actor: ev.args.recipient.toLowerCase(), quote: BigInt(ev.args.quoteOut), tokens: BigInt(ev.args.tokensIn), block: lg.blockNumber, tx: lg.transactionHash });
-      }
-    } catch {}
+      } else skipped++;
+    } catch { skipped++; }
   }
+  if (skipped > 0) console.warn(`⚠️ ${skipped} لاگِ نخوانا در اسکن کرو رد شد (احتمال تغییر ABI/رویداد)`);
   return out;
 }
 
@@ -39,7 +41,7 @@ export function median(xs) {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-// قیمت میانه‌ی نمایشی آخرین k معامله (خرید یا فروش) به واحد «ETH به ازای هر واحد توکن»
+// قیمت میانه‌ی نمایشی آخرین k معامله (خرید یا فروش) به واحد «wei به ازای هر واحد خام توکن»
 export async function marketPrice(curveAddr, fromBlock, k = 5) {
   const tr = await curveTrades(curveAddr, fromBlock);
   const last = tr.filter((t) => t.tokens > 0n).slice(-k);
@@ -48,34 +50,59 @@ export async function marketPrice(curveAddr, fromBlock, k = 5) {
   return { price: median(prices), tradesUsed: last.map((l) => l.type), lastBlock: last[last.length - 1].block };
 }
 
-// خروج موازی: هر ولت approve و بلافاصله sell با نانس صریح (بدون انتظار بین دو تراکنش)
-// در چانک‌های هم‌زمان — ولت‌های بدون موجودی رد می‌شوند
-export async function panicSellAll(tokenAddr, curveAddr, signers, gp, concurrency = 6) {
-  console.log(`🚨 خروج اضطراری موازی روی ${signers.length} ولت (هم‌زمانی ${concurrency})…`);
-  const jobs = signers.map(async (s) => {
+// حداقل خروجی تخمینی از روی قیمت میانه: minOut = مقدار × قیمت × (۱ − bps/۱۰۰۰۰)
+// اگر price نداشته باشیم صفر برمی‌گردد و caller باید هشدار دهد
+export function estMinOut(amountIn, weiPricePerRawUnit, bps = 800) {
+  if (!weiPricePerRawUnit || !(weiPricePerRawUnit > 0)) return 0n;
+  const est = Number(amountIn) * weiPricePerRawUnit * (1 - bps / 10000);
+  if (!Number.isFinite(est) || est <= 0) return 0n;
+  return BigInt(Math.floor(est));
+}
+
+// خروج موازی: approve و sell با نانس صریح؛ چانک‌ها «تنبل» ساخته می‌شوند (هم‌زمانی واقعاً محدود است)
+// گزینه: estPrice (wei به ازای واحد خام) + slippageBps ⇒ sell با minOut محافظت‌شده؛ بدون آن minOut=0
+// خروجی: { ok, fail, failList } — caller (exit/batch_buy) بر اساسش موفقیت/نقص گزارش می‌دهد
+export async function panicSellAll(tokenAddr, curveAddr, signers, gp, concurrency = 6, { estPrice = null, slippageBps = 800 } = {}) {
+  console.log(`🚨 خروج اضطراری موازی روی ${signers.length} ولت (هم‌زمانی ${concurrency})${estPrice ? ` | minOut تخمینی با لغزش ${slippageBps / 100}٪` : " | minOut=0 (بدون قیمت مرجع!)"}…`);
+  // نمایش درستِ تعداد توکن با رقم اعشار واقعی (fallback استاندارد ۱۸پونز)
+  let tokDec = 18;
+  try { tokDec = Number(await new Contract(tokenAddr, ERC20_ABI, provider).decimals()); } catch {}
+
+  const job = (s) => async () => {
     try {
       const token = new Contract(tokenAddr, ERC20_ABI, s);
       const bal = await token.balanceOf(s.address);
-      if (bal === 0n) return `— ${s.address}: موجودی صفر`;
+      if (bal === 0n) return { ok: true, line: `— ${s.address}: موجودی صفر` };
+      const minOut = estMinOut(bal, estPrice, slippageBps);
       const n = await provider.getTransactionCount(s.address, "pending");
       const curve = new Contract(curveAddr, BONDING_CURVE_ABI, s);
       const ap = await token.approve(curveAddr, bal, { gasPrice: gp, nonce: n });
       // sell با nonce+1 بلافاصله صادر می‌شود؛ اگر RPC نانس صف‌دار را رد کند: بعد از ماین approve با نانس تازه دوباره
       let tx;
       try {
-        tx = await curve.sell(bal, 0n, s.address, { gasPrice: gp, nonce: n + 1 });
+        tx = await curve.sell(bal, minOut, s.address, { gasPrice: gp, nonce: n + 1 });
       } catch {
-        await ap.wait();
-        tx = await curve.sell(bal, 0n, s.address, { gasPrice: gp });
+        await ap.wait(1, 120000);
+        // محافظ فروش دوباره: اگر تلاش اول در واقع موفق شده باشد، دوباره نفروش
+        if ((await token.balanceOf(s.address)) === 0n) {
+          return { ok: true, line: `✅ ${s.address}: قبلاً فروخته شده (موجودی صفر)` };
+        }
+        tx = await curve.sell(bal, minOut, s.address, { gasPrice: gp });
       }
-      await Promise.all([ap.wait(), tx.wait()]);
-      return `✅ ${s.address}: ${fmt(bal)} توکن فروخته شد → ${tx.hash}`;
+      await Promise.all([ap.wait(1, 120000), tx.wait(1, 120000)]);
+      return { ok: true, line: `✅ ${s.address}: ${formatUnits(bal, tokDec)} توکن فروخته شد → ${tx.hash}` };
     } catch (e) {
-      return `❌ ${s.address}: ${(e.shortMessage ?? e.message).slice(0, 100)}`;
+      return { ok: false, line: `❌ ${s.address}: ${(e.shortMessage ?? e.message).slice(0, 100)}` };
     }
-  });
-  for (let i = 0; i < jobs.length; i += concurrency) {
-    const res = await Promise.all(jobs.slice(i, i + concurrency));
-    res.forEach((r) => console.log("   " + r));
+  };
+
+  const results = [];
+  for (let i = 0; i < signers.length; i += concurrency) {
+    const res = await Promise.all(signers.slice(i, i + concurrency).map((s) => job(s)()));
+    results.push(...res);
+    res.forEach((r) => console.log("   " + r.line));
   }
+  const fails = results.filter((r) => !r.ok);
+  if (fails.length) console.log(`⚠️ خروج ناقص: ${fails.length} ولت ناموفق — اگر نقدینگی به V4 مهاجرت کرده است، با sell.js --ur-data یا دستی ادامه بده`);
+  return { ok: results.length - fails.length, fail: fails.length, failList: fails.map((f) => f.line) };
 }

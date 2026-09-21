@@ -8,6 +8,7 @@
     "ethers": "^6.13.4"
   },
   "scripts": {
+    "test": "node test/offline.test.mjs",
     "inspect": "node src/inspect.js",
     "launch": "node src/launch.js",
     "batch-buy": "node src/batch_buy.js",

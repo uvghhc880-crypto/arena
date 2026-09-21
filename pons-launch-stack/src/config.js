@@ -10,12 +10,18 @@ const ROOT = path.resolve(__dirname, "..");
 (function loadEnv() {
   const envPath = path.join(ROOT, ".env");
   if (!fs.existsSync(envPath)) return;
+  try {
+    const st = fs.statSync(envPath);
+    if (st.mode & 0o077) console.warn("⚠️ پرمیشن .env باز است — `chmod 600 .env` بزن تا کلیدها فقط برای خودت خوانا شوند");
+  } catch {}
   for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
     if (!m || m[1].startsWith("#")) continue;
     let val = m[2];
     if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
     if (val.startsWith("'") && val.endsWith("'")) val = val.slice(1, -1);
+    // کامنت انتهای خط (با فاصله) حذف می‌شود: KEY=0x1abc # یادداشت
+    if (val.includes(" #")) val = val.split(" #")[0].trim();
     if (process.env[m[1]] === undefined) process.env[m[1]] = val;
   }
 })();

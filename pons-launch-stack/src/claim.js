@@ -29,8 +29,9 @@ async function main() {
   console.log("کلیمر (ولت فی‌رسپینت):", claimer.address);
 
   const a = parseArgs();
+  // --all: کلیمر «هم» در لیست است (کلیمر اصلیِ کلیم) + مستر و کارگرها برای مانیتورینگ
   const targets = [];
-  if (all) targets.push(masterWallet(), ...(() => { try { return deriveWorkers(Number(env("WORKER_COUNT", "28")), workerStart(a)).map((w) => w.wallet); } catch { return []; } })());
+  if (all) targets.push(claimer, masterWallet(), ...(() => { try { return deriveWorkers(Number(env("WORKER_COUNT", "28")), workerStart(a)).map((w) => w.wallet); } catch { return []; } })());
   else targets.push(claimer);
 
   do {
@@ -38,14 +39,15 @@ async function main() {
       try {
         const claimed = await claimOnce(s, s === claimer ? "FEE" : "—");
         if (claimed && sweepTreasury && env("TREASURY_ADDRESS")) {
+          if (!ethers.isAddress(env("TREASURY_ADDRESS"))) { console.log("⛔ TREASURY_ADDRESS نامعتبر است"); continue; }
           let b = await s.provider.getBalance(s.address);
           const reserve = ethers.parseEther("0.0001");
           if (b > reserve) {
-            const gasPrice = (await s.provider.getFeeData()).gasPrice ?? 0n;
-            const value = b - reserve - (gasPrice * 21000n);
+            const gp = (await s.provider.getFeeData()).gasPrice ?? 0n;
+            const value = b - reserve - (gp * 21000n); // همان gp که برای محاسبه استفاده شد، در ارسال هم می‌آید
             if (value > 0n) {
-              const tx = await s.sendTransaction({ to: env("TREASURY_ADDRESS"), value });
-              await tx.wait();
+              const tx = await s.sendTransaction({ to: env("TREASURY_ADDRESS"), value, gasPrice: gp });
+              await tx.wait(1, 120000);
               console.log(`💰 sweep ${fmt(value)} ETH → خزانه (${tx.hash})`);
             }
           }

@@ -12,7 +12,7 @@
 import { Contract, Wallet } from "ethers";
 import { env, parseArgs } from "./config.js";
 import { ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, fmt, gasPrice, sleep } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep } from "./lib.js";
 import { curveTrades, panicSellAll, median } from "./market.js";
 
 async function resolveFromBlock(a) {
@@ -59,8 +59,8 @@ async function main() {
   const concurrency = Math.max(1, Number(a["concurrency"] ?? 6));
   const maxMin = Number(a["max-minutes"] ?? 0);
 
-  // مجموعه‌ی خودی + امضاکننده‌ها (کریتور + کارگرها + payer) — offset با batch_buy یکی
-  const selfSet = new Set();
+  // امضاکننده‌ها (کریتور + کارگرها + payer) — مبنای سرمایه/دارایی/خروج
+  const signerSet = new Set();
   const signers = [masterWallet()];
   const wc = Number(env("WORKER_COUNT", "28"));
   const wStart = workerStart(a);
@@ -69,16 +69,20 @@ async function main() {
   }
   const payerPk = env("BATCH_PAYER_PRIVATE_KEY");
   if (payerPk) { try { const w = new Wallet(payerPk, provider); signers.push(w); } catch {} }
-  signers.forEach((s) => selfSet.add(s.address.toLowerCase()));
+  signers.forEach((s) => signerSet.add(s.address.toLowerCase()));
+  // خودیِ رصد-فقط (بدون کلید): نه در مبنای سرمایه نه در دارایی — فقط نمایش لاگ
+  const monitorSet = new Set();
   (a["self-extra"] ?? "").split(",").map((s) => s.trim()).filter((s) => s.startsWith("0x"))
-    .forEach((s) => selfSet.add(s.toLowerCase()));
+    .forEach((s) => { if (!signerSet.has(s.toLowerCase())) monitorSet.add(s.toLowerCase()); });
+  const slippageBps = numOpt(a["slippage-bps"], Number(env("SLIPPAGE_BPS", "800")), { min: 0, max: 5000, name: "slippage-bps" });
 
   const fromBlock = await resolveFromBlock(a);
   const token = new Contract(a.token, ERC20_ABI, provider);
   const feeFactor = 1 - feeBps / 10000;
   const neededMult = 1 + minProfitPct / 100;
-  console.log(`🎯 هدف: سود خالص ≥ ${minProfitPct}٪ «پس از» ایمپکت+فی | مدل ${impactModel} | فی ${feeBps / 100}٪ | خودی‌ها ${selfSet.size} (worker-start=${wStart})`);
-  console.log("   (سرمایه هر چرخه از رویدادهای تازه بازمحاسبه می‌شود — هاردکد نیست)");
+  let exitAnomalyWarned = false;
+  console.log(`🎯 هدف: سود خالص ≥ ${minProfitPct}٪ «پس از» ایمپکت+فی | مدل ${impactModel} | فی ${feeBps / 100}٪ | امضاکننده‌ها ${signerSet.size}${monitorSet.size ? ` + رصد-فقط ${monitorSet.size}` : ""} (worker-start=${wStart})`);
+  console.log("   (مبنای سرمایه = جمع خریدهای خودی منهای فروش‌های خودی — هر چرخه از رویدادهای تازه)");
 
   const t0 = Date.now();
   while (true) {
@@ -87,13 +91,21 @@ async function main() {
       // ۱) معاملات تازه — برای سرمایه، فلوت و قیمت (همه از یک اسکن)
       const trades = await curveTrades(a.curve, fromBlock);
 
-      // ۲) سرمایه‌ی واقعی پرداخت‌شده از رویدادهای خرید خودی (هر چرخه تازه)
-      let spent = 0n;
+      // ۲) مبنای سرمایه: جمع خریدهای امضاکننده‌ها منهای بازپس‌گیری‌های آن‌ها (فروش‌های خودی)
+      //    → فروش‌های جزئی پیشین، مبنا را کم می‌کنند (رفع اشکال «سرمایه‌ی تاریخی انباشته»)
+      let spent = 0n, selfProceeds = 0n, monitorBuys = 0n;
       const selfBuyWallets = new Set();
       for (const t of trades) {
-        if (t.type === "buy" && selfSet.has(t.who)) { spent += t.quote; selfBuyWallets.add(t.who); }
+        if (t.type === "buy") {
+          if (signerSet.has(t.who)) { spent += t.quote; selfBuyWallets.add(t.who); }
+          else if (monitorSet.has(t.who)) monitorBuys += t.quote;
+        } else if (t.type === "sell" && signerSet.has(t.who)) {
+          selfProceeds += t.quote;
+        }
       }
+      const basis = spent > selfProceeds ? spent - selfProceeds : 0n;
       const spentEth = Number(fmt(spent));
+      const basisEth = Number(fmt(basis));
       if (!(spentEth > 0)) { console.log("— هنوز خرید خودی‌ای دیده نمی‌شود — صبر…"); await sleep(interval); continue; }
 
       // ۳) موجودی زنده‌ی توکن خودی‌ها
@@ -108,6 +120,7 @@ async function main() {
       // ۴) فلوت و قیمت میانه‌ی آخرین k معامله
       let floatWei = 0n;
       for (const t of trades) floatWei += (t.type === "buy" ? t.tokens : -t.tokens);
+      if (floatWei < 0n && !exitAnomalyWarned) { exitAnomalyWarned = true; console.warn("⚠️ فلوت منفی محاسبه شد (ناهنجاری داده — مثلاً اسکن از بلاک دیرتر از لانچ). مقدار به خودی clamp می‌شود."); }
       const floatRaw = Math.max(Number(floatWei), selfRaw); // فلوت نمی‌تواند از خودی‌ها کمتر باشد
       const last = trades.filter((t) => t.tokens > 0n).slice(-k);
       if (!last.length) { console.log("— هنوز معامله‌ای برای قیمت نیست — صبر…"); await sleep(interval); continue; }
@@ -123,27 +136,33 @@ async function main() {
         fillFactor = 1 - impactFixed;
       }
       const realized = mark * fillFactor * feeFactor;
-      const profitPct = (realized - spentEth) / spentEth * 100;
-      // ضریب مارک لازم برای رسیدن دقیق به آستانه
+      // اگر مبنا صفر است (سرمایه کاملاً برگشته) — هر مارک مثبت = سود بی‌نهایت (house money) → تریگر فوری
+      const profitPct = basisEth > 0 ? (realized - basisEth) / basisEth * 100 : (realized > 0 ? Infinity : 0);
+      // ضریب مارک لازم برای رسیدن دقیق به آستانه (نسبت به مبنا)
       const reqMarkMult = neededMult / (fillFactor * feeFactor);
 
       const selfShow = Number(fmt(totTokensWei)).toLocaleString("fa-IR", { maximumFractionDigits: 0 });
       const floatShow = Number(fmt(floatWei)).toLocaleString("fa-IR", { maximumFractionDigits: 0 });
-      console.log(`💰 سرمایه ${spentEth.toFixed(4)} ETH (${selfBuyWallets.size} ولت) | 📈 خودی ${selfShow} / فلوت ${floatShow} | ضریب مارک ${(mark / spentEth).toFixed(2)}× (لازم: ${reqMarkMult.toFixed(2)}×) | پرشدنی ×${fillFactor.toFixed(3)} | دریافتی خالص ~${realized.toFixed(4)} ETH | سود ${profitPct.toFixed(0)}٪ / آستانه ${minProfitPct}٪`);
+      const monitorTag = monitorSet.size && monitorBuys > 0n ? ` | 👁️ رصد-فقط خرید: ${Number(fmt(monitorBuys)).toFixed(3)}` : "";
+      console.log(`💰 مبنا ${basisEth.toFixed(4)} ETH${spent > basis ? ` (پرداخت ${spentEth.toFixed(4)} − بازپس‌گیری ${Number(fmt(selfProceeds)).toFixed(4)})` : ""} (${selfBuyWallets.size} ولت)${monitorTag} | 📈 خودی ${selfShow} / فلوت ${floatShow} | ضریب مارک ${(basisEth > 0 ? mark / basisEth : 0).toFixed(2)}× (لازم: ${reqMarkMult.toFixed(2)}×) | پرشدنی ×${fillFactor.toFixed(3)} | دریافتی خالص ~${realized.toFixed(4)} ETH | سود ${profitPct === Infinity ? "∞" : profitPct.toFixed(0)}٪ / آستانه ${minProfitPct}٪`);
 
       if (profitPct >= minProfitPct) {
-        console.log(`\n🎯 هدف رسید: سود خالص پس از ایمپکت = ${profitPct.toFixed(0)}٪ ≥ ${minProfitPct}٪ — خروج موازی کامل الان!\n`);
+        console.log(`\n🎯 هدف رسید: سود خالص پس از ایمپکت = ${profitPct === Infinity ? "∞" : profitPct.toFixed(0) + "٪"} ≥ ${minProfitPct}٪ — خروج موازی کامل الان!\n`);
         let before = 0n;
         for (const s of signers) { try { before += await provider.getBalance(s.address); } catch {} }
         const gp = await gasPrice();
-        await panicSellAll(a.token, a.curve, signers, gp, concurrency);
+        const pres = await panicSellAll(a.token, a.curve, signers, gp, concurrency, { estPrice: price, slippageBps });
         await sleep(2500);
         let after = 0n;
         for (const s of signers) { try { after += await provider.getBalance(s.address); } catch {} }
         const received = Number(fmt(after - before));
-        const realizedFinal = received / spentEth;
-        console.log(`💵 دریافتی واقعی پس از خروج (دلتای ETH منهای گس): ${received.toFixed(4)} ETH = ${realizedFinal.toFixed(2)}× سرمایه (سود واقعی ${((realizedFinal - 1) * 100).toFixed(0)}٪)`);
-        if (realizedFinal < neededMult) console.log(`⚠️ پرشدنی واقعی زیر مدل آمد (${realizedFinal.toFixed(2)} < ${neededMult.toFixed(2)}) — تخفیف/فی را محافظه‌کارتر کن (مثلاً --min-profit-pct بالاتر یا fee-bps بیشتر)`);
+        const realizedFinal = basisEth > 0 ? received / basisEth : 0;
+        if (pres.fail > 0) {
+          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق — با sell.js یا دستی تکمیل کن؛ ژورنال بالا راهنماست`);
+        } else {
+          console.log(`💵 دریافتی واقعی پس از خروج (دلتای ETH منهای گس): ${received.toFixed(4)} ETH${basisEth > 0 ? ` = ${realizedFinal.toFixed(2)}× مبنا (سود واقعی ${((realizedFinal - 1) * 100).toFixed(0)}٪)` : ""}`);
+          if (basisEth > 0 && realizedFinal < neededMult) console.log(`⚠️ پرشدنی واقعی زیر مدل آمد (${realizedFinal.toFixed(2)} < ${neededMult.toFixed(2)}) — تخفیف/فی را محافظه‌کارتر کن`);
+        }
         return;
       }
     } catch (e) {

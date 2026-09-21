@@ -15,7 +15,7 @@ jobs:
         continue-on-error: true
         env:
           DEADLINE_SECONDS: '1200'
-        run: python3 _analysis/probe.py 2>&1 | tee _analysis/run.log | tail -140
+        run: python3 _analysis/fetch3.py 2>&1 | tee _analysis/run.log | tail -140
       - name: pack + index
         if: always()
         run: |

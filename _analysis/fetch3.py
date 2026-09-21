@@ -31,15 +31,23 @@ def log(*a):
         print(*a, flush=True)
 
 
-def get(url, tries=3):
+BROWSER_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": BASE,
+    "referer": BASE + "/",
+    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+}
+
+
+def get(url, tries=4):
     if time.time() > DEADLINE:
         raise TimeoutError("deadline")
     err = None
     for attempt in range(tries):
         try:
-            req = urllib.request.Request(
-                url, headers={"accept": "application/json", "user-agent": "analysis/1.0"}
-            )
+            req = urllib.request.Request(url, headers=BROWSER_HEADERS)
             with urllib.request.urlopen(req, timeout=25) as resp:
                 return json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:

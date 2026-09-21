@@ -6,33 +6,43 @@ on:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: fetch data
         continue-on-error: true
         env:
           DEADLINE_SECONDS: '1200'
-        run: python3 _analysis/fetch2.py 2>&1 | tail -100
-      - name: index
+        run: python3 _analysis/fetch3.py 2>&1 | tee _analysis/run.log | tail -140
+      - name: pack + index
         if: always()
         run: |
           python3 - <<'PY'
           import json, os, glob
-          for p in sorted(glob.glob('_analysis/raw*/*.json')):
+          for p in sorted(glob.glob('_analysis/raw/*.json')):
               try:
-                  d = json.load(open(p))
-                  n = d.get('count') if isinstance(d, dict) else 1
+                  d = json.load(open(p)); n = d.get('count') if isinstance(d, dict) else 1
               except Exception:
                   n = -1
-              print('%-62s %9d bytes n=%s' % (p, os.path.getsize(p), n))
+              print('%-58s %9d bytes n=%s' % (p, os.path.getsize(p), n))
           PY
+          tar -czf _analysis/raw-data.tgz -C _analysis raw run.log || true
+          ls -la _analysis | tail -5
+      - name: commit results
+        if: always()
+        run: |
+          git config user.name "analysis-bot"
+          git config user.email "analysis-bot@users.noreply.github.com"
+          git add -f _analysis/raw-data.tgz _analysis/run.log
+          git commit -m "data: blockscout dump [skip ci]" || echo "nothing to commit"
+          git pull --rebase --autostash || true
+          git push || echo "push failed"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: raw-data
-          path: |
-            _analysis/raw
-            _analysis/raw2
+          path: _analysis/raw
           retention-days: 7
           if-no-files-found: warn

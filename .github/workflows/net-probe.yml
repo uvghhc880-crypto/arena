@@ -1,0 +1,13 @@
+name: net-probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe
+        run: |
+          set -x
+          curl -s -m 30 "https://robinhoodchain.blockscout.com/api/v2/health" || true
+          echo
+          curl -s -m 30 -X POST "https://rpc.mainnet.chain.robinhood.com" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' || true

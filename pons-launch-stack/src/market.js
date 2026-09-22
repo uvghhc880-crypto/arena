@@ -2,7 +2,7 @@
 // و خروج اضطراری موازی (همان motor پنیک — کریتور + باندل‌ها در چانک‌های هم‌زمان)
 import { Contract, Interface, formatUnits } from "ethers";
 import { BONDING_CURVE_ABI, ERC20_ABI } from "./abis.js";
-import { provider, fmt } from "./lib.js";
+import { provider, fmt, uniqueSigners } from "./lib.js";
 
 export const curveIface = new Interface(BONDING_CURVE_ABI);
 export const CURVE_BUY_TOPIC = curveIface.getEvent("CurveBuy").topicHash;
@@ -42,27 +42,43 @@ export function median(xs) {
 }
 
 // قیمت میانه‌ی نمایشی آخرین k معامله (خرید یا فروش) به واحد «wei به ازای هر واحد خام توکن»
+// خروجی: { price: میانه (مدل)، last: «قیمت آخرین معامله» (نزدیک‌ترین چیزی به quote اجرایی)، lastBuy/lastSell }
 export async function marketPrice(curveAddr, fromBlock, k = 5) {
   const tr = await curveTrades(curveAddr, fromBlock);
   const last = tr.filter((t) => t.tokens > 0n).slice(-k);
   if (!last.length) return null;
   const prices = last.map((t) => Number(t.quote) / Number(t.tokens));
-  return { price: median(prices), tradesUsed: last.map((l) => l.type), lastBlock: last[last.length - 1].block };
+  const veryLast = last[last.length - 1];
+  const lastTrade = Number(veryLast.quote) / Number(veryLast.tokens);
+  const lb = [...last].reverse().find((t) => t.type === "buy");
+  const ls = [...last].reverse().find((t) => t.type === "sell");
+  return {
+    price: median(prices),
+    last: lastTrade,
+    lastBuy: lb ? Number(lb.quote) / Number(lb.tokens) : null,
+    lastSell: ls ? Number(ls.quote) / Number(ls.tokens) : null,
+    tradesUsed: last.map((l) => l.type),
+    lastBlock: veryLast.block,
+  };
 }
 
-// حداقل خروجی تخمینی از روی قیمت میانه: minOut = مقدار × قیمت × (۱ − bps/۱۰۰۰۰)
-// اگر price نداشته باشیم صفر برمی‌گردد و caller باید هشدار دهد
-export function estMinOut(amountIn, weiPricePerRawUnit, bps = 800) {
-  if (!weiPricePerRawUnit || !(weiPricePerRawUnit > 0)) return 0n;
-  const est = Number(amountIn) * weiPricePerRawUnit * (1 - bps / 10000);
-  if (!Number.isFinite(est) || est <= 0) return 0n;
-  return BigInt(Math.floor(est));
+// حداقل خروجی تخمینی: minOut = مقدار × قیمت × (۱ − bps/۱۰۰۰۰) — محاسبه‌ی صحیح BigInt با ضریب Q64 (بدون ازدست‌دقت float)
+// anchor: اگر داده شود همان استفاده می‌شود (مثلاً قیمت آخرین معامله به‌جای میانه)؛ اگر price نباشد صفر برمی‌گردد و caller باید تصمیم بگیرد
+export function estMinOut(amountIn, weiPricePerRawUnit, bps = 800, { anchor = null } = {}) {
+  const p = anchor ?? weiPricePerRawUnit;
+  if (!p || !(p > 0)) return 0n;
+  const Q64 = 1n << 64n;
+  const priceQ64 = BigInt(Math.floor(p * 2 ** 64));
+  if (priceQ64 === 0n) return 0n;
+  const out = (BigInt(amountIn) * priceQ64 * (10000n - BigInt(Math.round(bps)))) / (10000n * Q64);
+  return out > 0n ? out : 0n;
 }
 
 // خروج موازی: approve و sell با نانس صریح؛ چانک‌ها «تنبل» ساخته می‌شوند (هم‌زمانی واقعاً محدود است)
 // گزینه: estPrice (wei به ازای واحد خام) + slippageBps ⇒ sell با minOut محافظت‌شده؛ بدون آن minOut=0
 // خروجی: { ok, fail, failList } — caller (exit/batch_buy) بر اساسش موفقیت/نقص گزارش می‌دهد
-export async function panicSellAll(tokenAddr, curveAddr, signers, gp, concurrency = 6, { estPrice = null, slippageBps = 800 } = {}) {
+export async function panicSellAll(tokenAddr, curveAddr, signersIn, gp, concurrency = 6, { estPrice = null, slippageBps = 800 } = {}) {
+  const signers = uniqueSigners(signersIn); // دو بار فروش برای یک آدرس = تصادم nonce
   console.log(`🚨 خروج اضطراری موازی روی ${signers.length} ولت (هم‌زمانی ${concurrency})${estPrice ? ` | minOut تخمینی با لغزش ${slippageBps / 100}٪` : " | minOut=0 (بدون قیمت مرجع!)"}…`);
   // نمایش درستِ تعداد توکن با رقم اعشار واقعی (fallback استاندارد ۱۸پونز)
   let tokDec = 18;

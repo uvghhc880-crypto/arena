@@ -53,3 +53,11 @@ export const UNIVERSAL_ROUTER_ABI = [
   "function execute(bytes commands, bytes[] inputs, uint256 deadline) payable",
   "function execute(bytes commands, bytes[] inputs) payable",
 ];
+
+// Uniswap Permit2 (Canonical: 0x000000000022D473030F116dDEE9F6B43aC78BA3)
+// جریان اجازه: اول token.approve(Permit2, max)، بعد permit2.approve(token, router, amount, expiration)
+// ← UR مسیر V3/V4 ورودی توکن را از طریق Permit2 می‌کشد؛ بدون این آماده‌سازی execute ریورت می‌کند.
+export const PERMIT2_ABI = [
+  "function approve(address token, address spender, uint160 amount, uint48 expiration) external",
+  "function allowance(address user, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce)",
+];

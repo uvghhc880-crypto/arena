@@ -2,15 +2,17 @@
 // + دیده‌بان خرید خارجی: رد آستانه → توقف باندل + خروج موازی کامل (پیش‌فرض: کریتور + همه‌ی باندل‌ها)
 // + توقف خودکار در گرجوئیشن (پیش‌فرض روشن)
 // + سپرهای امنیتی: ولیدیشن آدرس‌ها، --launch-file (کرو/توکن/workerStart + چک recipient ⊆ exemptions)،
-//   شبیه‌سازی eth_call قبل از هر ارسال، --dry-run (بدون هیچ ارسالی)، نرمال‌سازی مبالغ به ≤ total
-// + minOut تخمینی از قیمت میانه (ضد سندویچ) | ژورنال افزایشی بعد از هر تراکنش (ضد کرش) | run-lock
+//   شبیه‌سازی eth_call قبل از هر ارسال، --dry-run (بدون هیچ ارسالی)
+// + تخصیص دقیق BigInt (جمع = total، مین تضمینی — splitWeiRandom) | minOut تخمینی (فروش:قیمت، خرید:معکوس قیمت)
+// + ژورنال اتمیک با RESUME واقعی: اجرای دوم همان لانچ، خریدهای ماینشده را از سر نمی‌خرد (ضد تراکنش تکراری)
+// + run-lock مالکیت‌دار اتمیک ('wx' + توکن): اجرای دوم هرگز لاک مالک دیگر را پاک نمی‌کند
 // نکته‌ی طراحی: خریدها عمداً ترتیبی‌اند — قبل از هر ارسال شبیه‌سازی + چک گارد می‌آید؛ موازی‌سازی
-//   کور این سپرها را می‌شکند (همان نکته‌ای که ممیز به‌عنوان «عدم هم‌زمانی» گزارش کرد — تصمیم آگاهانه است).
+//   کور این سپرها را می‌شکند. برای سرعت ۲–۱۰ ثانیه‌ای با ۲۸ ولت، معماری متفاوتی لازم است (مستند در README).
 import fs from "node:fs";
 import { Contract, Interface, Wallet, id, isAddress, formatUnits } from "ethers";
 import { ADDR, CHAIN, LAUNCHES_DIR, env, parseArgs } from "./config.js";
 import { BONDING_CURVE_ABI, ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, eth, fmt, gasPrice, splitRandom, nowTag, sleep } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, weiOf, splitWeiRandom, nowTag, sleep, atomicWriteJson, readJsonSafe, classifyTx } from "./lib.js";
 import { panicSellAll, marketPrice, estMinOut } from "./market.js";
 
 const MIN_BUY_ETH = 0.0005;
@@ -118,26 +120,49 @@ async function buildGraduationChecker(curveAddr) {
     try {
       const cur = await provider.getBalance(curveAddr);
       let g = false;
-      if (prev !== null && prev >= eth("0.01") && cur <= prev / 10n) g = true;
+      if (prev !== null && prev >= weiOf(0.01) && cur <= prev / 10n) g = true;
       prev = cur;
       return { graduated: g, how: "افت ~۹۰٪ رزرو (مهاجرت لیکوییدیتی)" };
     } catch { return { graduated: false, how: "balance" }; }
   };
 }
 
-// ---------------- run-lock ----------------
+// ---------------- run-lock مالکیت‌دار و اتمیک ----------------
+// ساخت انحصاری با 'wx' ⇒ دو پردازش هم‌زمان نمی‌توانند هر دو تصاحب کنند (ضد TOCTOU).
+// توکن مالک: پاک‌کردن فقط وقتی توکن فایل == توکن ما ⇒ اجرای دوم (حتی کمکی/بدون آرگومان)
+// هرگز لاک فرایند فعال دیگر را پاک نمی‌کند. هندلر exit فقط بعد از تصاحب موفق معنا دارد.
+let lockToken = null;
 function acquireLock(force) {
-  if (fs.existsSync(LOCK_FILE)) {
-    const prev = fs.readFileSync(LOCK_FILE, "utf8");
-    if (!force) {
-      console.log(`⛔ run-lock فعال است (${LOCK_FILE}): ${prev}\nاگر اجرای قبلی واقعاً مرده، با --force دوباره بیا.`);
-      process.exit(1);
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  for (;;) {
+    try {
+      const fd = fs.openSync(LOCK_FILE, "wx"); // اتمیک: EEXIST اگر از قبل باشد
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
+      fs.closeSync(fd);
+      lockToken = token;
+      return;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      const prev = (() => { try { return fs.readFileSync(LOCK_FILE, "utf8"); } catch { return "?"; } })();
+      if (!force) {
+        console.log(`⛔ run-lock فعال است (${LOCK_FILE}): ${prev}\nاگر اجرای قبلی واقعاً مرده، با --force دوباره بیا.`);
+        process.exit(1);
+      }
+      console.warn("⚠️ run-lock قبلی با --force نادیده گرفته شد");
+      try { fs.unlinkSync(LOCK_FILE); } catch (e2) { if (e2.code !== "ENOENT") throw e2; }
+      // حلقه دوباره: ساخت انحصاری
     }
-    console.warn("⚠️ run-lock قبلی با --force نادیده گرفته شد");
   }
-  fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
 }
-function releaseLock() { try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); } catch {} }
+function releaseLock() {
+  if (!lockToken) return; // مالک نیستیم ⇒ دست نمی‌زنیم
+  try {
+    const j = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+    if (j.token !== lockToken) { console.warn("⚠️ لاک متعلق به پردازش دیگری است — دست نخورده ماند"); return; }
+    fs.unlinkSync(LOCK_FILE);
+  } catch {}
+  lockToken = null;
+}
 process.on("exit", releaseLock);
 
 async function main() {
@@ -204,11 +229,16 @@ async function main() {
   --window-blocks 200     فقط N بلاک اخیر شمرده شود (نگهبانی)
   --panic-sell            خروج موازی کامل کریتور + همه‌ی باندل‌ها هنگام تریگر (پیش‌فرض)
   --panic-creator-only    فقط کریتور خارج شود | --panic-concurrency 6
-  --slippage-bps 800      لغزش مجاز برای minOut تخمینی از قیمت میانه (پیش‌فرض SLIPPAGE_BPS)
+  --slippage-bps 800      لغزش مجاز برای minOut تخمینی از قیمت آخرین معاملات (پیش‌فرض SLIPPAGE_BPS)
+  --min-out 0             minOut صریح (۰ = بدون محافظت؛ اگر قیمت مرجع نباشد اجرا بدون --allow-zero-minout متوقف می‌شود)
+  --allow-zero-minout     اجازه‌ی اجرا با minOut=0 (پذیرفتن ریسک سندویچ — پیش‌فرض: لغو)
+  --min-share 0.0005      حداقل سهم خرید هر ولت (اگر total < n×minShare ⇒ لغو با پیام)
+  --journal x.json        مسیر ژورنال دستی (پیش‌فرض: تعیین‌شده با کرو/توکن — همان لانچ = resume خودکار)
+  --fresh                 ژورنال تازه بساز (resume خاموش — فقط اگر می‌دانی می‌خواهی دوباره بخری!)
   --watch-only            فقط دیده‌بان  |  --watch-minutes 30
   --check-every 3         هر چند خرید یک‌بار گارد چک شود
   --worker-start 0        آفست مشتق‌گیری کارگرها (با launch-file خودکار از رکورد می‌آید)
-  --force                 نادیده‌گرفتن run-lock اجرای قبلی
+  --force                 شکستن run-lock مالک پردازش مرده
   --ignore-graduation     توقف‌در‌گرجوئیشن را خاموش می‌کند (پیش‌فرض روشن)`);
     process.exit(1);
   }
@@ -226,11 +256,10 @@ async function main() {
   const checkEvery = Math.max(1, Number(a["check-every"] ?? 3));
   const stopOnGrad = !truthy(a["ignore-graduation"]);
   const totalEth = numOpt(a.total, 0, { min: 0.0001, max: 1000, name: "total" });
+  const totalWei = weiOf(totalEth);
   const slippageBps = numOpt(a["slippage-bps"], Number(env("SLIPPAGE_BPS", "800")), { min: 0, max: 5000, name: "slippage-bps" });
   const panicConcurrency = Math.max(1, Number(a["panic-concurrency"] ?? 6));
-
-  if (!dryRun && recipients.length * MIN_BUY_ETH > totalEth)
-    console.warn(`⚠️ total (${totalEth}) کمتر از ${recipients.length} × حداقل خرید (${MIN_BUY_ETH}) است — بعد از نرمال‌سازی، بعضی سهم‌ها از حداقل پایین‌تر می‌آیند`);
+  const minShareEth = numOpt(a["min-share"], MIN_BUY_ETH, { min: 0.000001, name: "min-share" });
 
   // مجموعه‌ی خودی = معاف‌ها + کریتور + payer
   const selfSet = new Set(recipients.map((r) => r.toLowerCase()));
@@ -239,7 +268,7 @@ async function main() {
   const fromBlock = await resolveFromBlock(a, { quiet: a["external-abort-eth"] === undefined });
   const guard = circuit !== null
     ? new ExternalGuard(a.curve, fromBlock, selfSet, {
-        minTxWei: a["min-ext-tx"] ? eth(Number(a["min-ext-tx"]).toFixed(6)) : 0n,
+        minTxWei: a["min-ext-tx"] ? weiOf(Number(a["min-ext-tx"])) : 0n,
         windowBlocks: Math.max(0, Number(a["window-blocks"] ?? 0)),
       })
     : null;
@@ -248,7 +277,14 @@ async function main() {
   const gradCheck = stopOnGrad && !dryRun ? await buildGraduationChecker(a.curve) : null;
 
   // قیمت مرجع لحظه‌ای (برای minOut پنیک/خریدها) — قبل از تعریف guardCheck اعلان می‌شود تا در TDZ نیفتد
-  let estPriceNow = null;
+  let estPriceNow = null;   // { price, last, ... } از marketPrice
+  let estPriceTs = 0;
+  async function refPrice() {
+    const now = Date.now();
+    if (!estPriceNow || now - estPriceTs > 2000) {
+      try { estPriceNow = await marketPrice(a.curve, fromBlock, 5); estPriceTs = now; } catch {}
+    }
+  }
 
   async function guardCheck(tag) {
     if (!guard) return false;
@@ -269,13 +305,13 @@ async function main() {
     console.log(`\n⛔ آستانه رد شد (${ethFloat.toFixed(4)} ≥ ${circuit} ETH) — توقف فوری باندل!`);
     if (panic && !dryRun) {
       const gp = await gasPrice();
-      // پیش‌فرض خروج = کریتور + همه‌ی باندل‌ها؛ محدود کردن با --panic-creator-only
+      // پیش‌فرض خروج = کریتور + همه‌ی باندل‌ها (+payer اگر جداست)؛ محدود کردن با --panic-creator-only
       const signers = [masterWallet()];
       if (!truthy(a["panic-creator-only"])) {
         const n = Number(env("WORKER_COUNT", "28"));
         try { signers.push(...deriveWorkers(n, workerStart(a)).map((w) => w.wallet)); } catch {}
       }
-      await panicSellAll(a.token, a.curve, signers, gp, panicConcurrency, { estPrice: estPriceNow, slippageBps });
+      await panicSellAll(a.token, a.curve, signers, gp, panicConcurrency, { estPrice: estPriceNow?.price ?? null, slippageBps });
     }
     return true;
   }
@@ -311,7 +347,8 @@ async function main() {
 
   const payer = payerWallet(a);
   selfSet.add(payer.address.toLowerCase());
-  const minOutFlag = a["min-out"] ? BigInt(a["min-out"]) : null;
+  const minOutFlag = a["min-out"] !== undefined ? BigInt(a["min-out"]) : null;   // --min-out 0 یعنی «عمداً بدون محافظت»
+  const allowZeroMinOut = truthy(a["allow-zero-minout"]) || minOutFlag === 0n;
   const perDelay = Number(a.delay ?? 100);
   const curve = new Contract(a.curve, BONDING_CURVE_ABI, payer);
   // رقم اعشار واقعی توکن برای نمایش درست مقادیر (fallback = استاندارد ۱۸ پونز)
@@ -319,15 +356,21 @@ async function main() {
   let tokDec = 18;
   try { tokDec = Number(await tokenRead.decimals()); } catch { /* توکن استاندارد پونز = ۱۸ */ }
 
-  // نرمال‌سازی: بامپ به حداقل خرید، سپس مقیاس‌کاری تا جمع دقیقاً ≤ total (هیچ ETH اضافی خرج نمی‌شود)
-  let amounts = splitRandom(totalEth, recipients.length).map((x) => Math.max(x, MIN_BUY_ETH));
-  const amountsSum = amounts.reduce((x, y) => x + y, 0);
-  if (amountsSum > totalEth) amounts = amounts.map((x) => (x * totalEth) / amountsSum);
+  // تخصیص دقیق BigInt: هر سهم ≥ min-share و جمع دقیقاً = total؛ اگر غیرممکن باشد با پیام روشن لغو
+  const minShareWei = weiOf(minShareEth);
+  let amountsWei;
+  try {
+    amountsWei = splitWeiRandom(totalWei, recipients.length, dryRun ? 0n : minShareWei);
+  } catch (e) {
+    console.log(`⛔ تخصیص غیرممکن: ${e.message}\n   راه‌حل: --total را بیشتر کن یا تعداد recipientها را کم کن (یا --min-share را کمتر).`);
+    releaseLock();
+    process.exit(1);
+  }
 
   // موجودی payer: total + برآورد گس واقعی (به‌جای عدد ثابت)
   let gp = await gasPrice();
   const gasReserve = gp * 150000n * BigInt(recipients.length);
-  const need = eth(totalEth.toFixed(6)) + gasReserve;
+  const need = totalWei + gasReserve;
   const bal = await provider.getBalance(payer.address);
   if (bal < need) {
     console.log(`⛔ موجودی پرداخت‌کننده (${payer.address}) کافی نیست: ${fmt(bal)} < ${fmt(need)} (total + رزرو گس تخمینی ${fmt(gasReserve)}) — اول payer را شارژ کن`);
@@ -335,42 +378,133 @@ async function main() {
     process.exit(1);
   }
 
-  // قیمت مرجع برای minOut خریدها (ضد سندویچ): میانه‌ی آخرین معاملات کرو
-  try { estPriceNow = (await marketPrice(a.curve, fromBlock, 5))?.price ?? null; } catch {}
-  if (!estPriceNow && !minOutFlag) console.warn("⚠️ قیمت مرجع پیدا نشد — minOut=0 (فعلاً حفاظت لغزش نداریم؛ با --min-out صریح می‌توانی بدهی)");
+  // قیمت مرجع برای minOut خریدها (ضد سندویچ): آخرین معاملات کرو
+  await refPrice();
+  if (!estPriceNow && !allowZeroMinOut && minOutFlag === null) {
+    console.log(`⛔ قیمت مرجع برای تخمین minOut پیدا نشد (هنوز معامله‌ای روی کرو نیست یا RPC ضعیف است).
+   سیاست امن: خرید بدون محافظت لغزش انجام نمی‌شود. اگر عمداً minOut=0 می‌خواهی: --allow-zero-minout (یا --min-out 0)`);
+    releaseLock();
+    process.exit(1);
+  }
+  if (!estPriceNow && minOutFlag === null && allowZeroMinOut) console.warn("⚠️ بدون قیمت مرجع و با minOut=0 — ریسک سندویچ را پذیرفتی!");
 
   console.log(`🧺 بچ‌بای${dryRun ? " (DRY-RUN — هیچ تراکنشی ارسال نمی‌شود)" : ""} | پرداخت‌کننده: ${payer.address}
 📦 کرو: ${a.curve}
 👥 ${recipients.length} ولت | مجموع ${totalEth} ETH | توقف-در-گرجوئیشن: ${gradCheck ? "روشن" : "خاموش"} | لغزش minOut: ${slippageBps / 100}٪`);
 
-  // ژورنال افزایشی: بعد از هر تراکنش روی دیسک به‌روز می‌شود → کرش = نقشه‌ی کامل وضعیت
-  const journalFile = `${LAUNCHES_DIR}/${nowTag()}_batchbuy.json`;
-  const journal = { payer: payer.address, curve: a.curve, token: a.token, totalEth, chainId: CHAIN.id, dryRun, stoppedBy: null, results: [], failed: [], startedAt: new Date().toISOString() };
-  const J = () => fs.writeFileSync(journalFile, JSON.stringify(journal, null, 2));
+  // ---------------- ژورنال اتمیک با resume ----------------
+  // پیش‌فرض: مسیر تعیین‌شده از روی کرو/توکن ⇒ اجرای دوم همان لانچ خودکار «ادامه» است (idempotent)
+  const fresh = truthy(a.fresh);
+  const journalFile = a.journal
+    ?? (fresh ? `${LAUNCHES_DIR}/${nowTag()}_batchbuy.json` : `${LAUNCHES_DIR}/batchbuy_${a.curve.slice(2, 10)}_${a.token.slice(2, 10)}.json`);
+  const header = { chainId: CHAIN.id, curve: a.curve, token: a.token, payer: payer.address };
+  let journal;
+  const existing = readJsonSafe(journalFile);
+  if (existing && !fresh) {
+    const h = existing.header ?? {};
+    const mismatch = ["chainId", "curve", "token", "payer"].filter((k) => String(h[k] ?? "").toLowerCase() !== String(header[k]).toLowerCase());
+    if (mismatch.length) {
+      console.log(`⛔ ژورنال موجود (${journalFile}) برای مجموعه‌ی دیگری است (ناهماهنگی: ${mismatch.join(", ")}).
+   برای ادامه‌ی آن با همان پارامترهای قبلی اجرا کن، یا عمداً با --fresh ژورنال تازه بساز.`);
+      releaseLock();
+      process.exit(1);
+    }
+    journal = existing;
+    console.log(`♻️ RESUME از ژورنال: ${journalFile}`);
+    // وریفای آنچین رکوردهای قبلی — وضعیت واقعی مرجع است نه متن فایل
+    const verified = [];
+    for (const r of journal.results ?? []) {
+      if (!r.tx) { console.log(`   ℹ️ رکورد بدون هش — دوباره انجام می‌شود: ${r.recipient}`); continue; }
+      const st = await classifyTx(r.tx, { polls: 1 });
+      if (st === "ok") verified.push(r);
+      else console.log(`   ⚠️ تراکنش قبلی ${r.tx} وضعیت «${st}» دارد ⇒ دوباره انجام می‌شود: ${r.recipient}`);
+    }
+    // شکست‌های دارای هش: شاید بعداً ماین شده‌اند (broadcast ولی timeout) → وریفای
+    const keepFailed = [];
+    for (const f of journal.failed ?? []) {
+      if (!f.tx) { keepFailed.push(f); continue; }
+      const st = await classifyTx(f.tx, { polls: 2, intervalMs: 4000 });
+      if (st === "ok") { verified.push({ ...f, tx: f.tx, recovered: true }); console.log(`   ✅ شکستِ قبلی در واقع ماین شده بود: ${f.recipient} (${f.tx})`); }
+      else keepFailed.push(f);
+    }
+    journal.results = verified; journal.failed = keepFailed;
+    // ریسک بالقوه: ورودی‌های pending/absent دوباره ارسال می‌شوند — برای absent امن است؛
+    // pending اما ممکن است هنوز ماین شود ⇒ صبر ۱۵ ثانیه + بازبینی قبل از ادامه
+    const pendingAgain = keepFailed.filter((f) => f.pending);
+    if (pendingAgain.length) console.log(`   ⏳ ${pendingAgain.length} تراکنش «در تعلیق» است — قبل از retry صبر می‌کنیم…`);
+  } else {
+    if (existing && fresh) console.log(`--fresh: ژورنال تازه ساخته می‌شود (${journalFile})`);
+    journal = { header, totalEth, dryRun, stoppedBy: null, results: [], failed: [], startedAt: new Date().toISOString() };
+  }
+  const J = () => atomicWriteJson(journalFile, journal);
   J();
 
+  const doneSet = new Set((journal.results ?? []).map((r) => r.recipient.toLowerCase()));
+  // failed-های بدون tx (مانند ریورت‌های تکراری) دوباره تلاش می‌شوند مگر نتیجه جدید
+  if (doneSet.size) console.log(`📌 ${doneSet.size} خریدِ تأییدشده‌ی قبلی از سر گرفته نمی‌شود (idempotent).`);
   const results = journal.results;
-  let stoppedBy = null;
+  let stoppedBy = journal.stoppedBy && journal.stoppedBy !== "completed" ? journal.stoppedBy : null;
 
-  // داده‌ی خرید با minOut: اگر --min-out صریح داده‌ای همان، وگرنه تخمین از قیمت میانه
+  // داده‌ی خرید با minOut: --min-out صریح اول، بعد تخمین از قیمت آخرین معاملات (خرید = معکوس قیمت)
   const minOutFor = (quoteIn) => {
     if (minOutFlag !== null) return minOutFlag;
-    return estMinOut(quoteIn, estPriceNow ? 1 / estPriceNow : null, slippageBps); // توکن = ETH ÷ قیمت
+    const p = estPriceNow?.last ?? estPriceNow?.price ?? null;
+    return estMinOut(quoteIn, p ? 1 / p : null, slippageBps); // توکن = ETH ÷ قیمت
   };
+
+  async function doSend(target, quoteIn) {
+    const data = curveIface.encodeFunctionData("buy", [quoteIn, minOutFor(quoteIn), target]);
+    // شبیه‌سازی قبل از ارسال — محافظ اصلی: اگر ریورت کند ETH از دست نمی‌رود
+    await provider.call({ to: a.curve, data, value: quoteIn, from: payer.address });
+    gp = await gasPrice(); // گس‌پرایس تازه برای هر تراکنش
+    const tx = await payer.sendTransaction({ to: a.curve, data, value: quoteIn, gasPrice: gp });
+    return { tx, data };
+  }
+
+  async function waitAndRecord(target, quoteIn, tx, data) {
+    try {
+      const rc = await tx.wait(1, 120000);
+      let tokensOut = null;
+      for (const log of rc.logs) {
+        if (log.address.toLowerCase() === a.curve.toLowerCase() && log.topics[0] === CURVE_BUY_TOPIC) {
+          const ev = curveIface.parseLog({ topics: log.topics, data: log.data });
+          if (ev.args.recipient.toLowerCase() === target.toLowerCase()) tokensOut = ev.args.tokensOut;
+        }
+      }
+      results.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, tokensOut: tokensOut?.toString() ?? null, block: rc.blockNumber });
+      J(); // ژورنال بعد از هر موفقیت
+      console.log(`✅ ${target} | ${fmt(quoteIn)} ETH | توکن: ${tokensOut ? formatUnits(tokensOut, tokDec) : "?"} | بلاک ${rc.blockNumber} | ${tx.hash}`);
+      return "ok";
+    } catch (e) {
+      // TIMEOUT/قطع RPC ⇒ وضعیت واقعی تراکنش را از زنجیره بپرس تا خرید تکراری ثبت نشود
+      console.log(`⚠️ دریافت رسید ممکن نشد (${(e.shortMessage ?? e.message).slice(0, 80)}) — پرس‌وجوی وضعیت ${tx.hash}…`);
+      const st = await classifyTx(tx.hash, { polls: 3, intervalMs: 5000 });
+      if (st === "ok") {
+        results.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, tokensOut: null, recovered: true });
+        J();
+        console.log(`✅ تراکنش در واقع ماین شد (پس از قطعی) — ثبت موفق: ${tx.hash}`);
+        return "ok";
+      }
+      journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, pending: st === "pending", error: `tx ${st}: ${(e.shortMessage ?? e.message).slice(0, 120)}` });
+      J();
+      console.log(`❌ تراکنش «${st}» است (${tx.hash}) — ${st === "reverted" ? "ریورت شد؛ امن برای retry" : st === "pending" ? "هنوز در تعلیق — اجرای بعدی اول وضعیتش را می‌خواند" : "در شبکه دیده نمی‌شود → امن برای retry"}`);
+      return st;
+    }
+  }
 
   // DRY-RUN: فقط شبیه‌سازی همه‌ی خریدها (روی state فعلی — اثر تجمعی خریدهای قبلی شبیه‌سازی نمی‌شود؛ مستند)
   if (dryRun) {
     let ok = 0, fail = 0;
     for (let i = 0; i < recipients.length; i++) {
-      const quoteIn = eth(amounts[i].toFixed(6));
+      const quoteIn = amountsWei[i];
       const data = curveIface.encodeFunctionData("buy", [quoteIn, minOutFor(quoteIn), recipients[i]]);
       try {
         await provider.call({ to: a.curve, data, value: quoteIn, from: payer.address });
         ok++;
-        console.log(`🧪 [${i + 1}/${recipients.length}] ${recipients[i]} → ${amounts[i].toFixed(4)} ETH: شبیه‌سازی OK`);
+        console.log(`🧪 [${i + 1}/${recipients.length}] ${recipients[i]} → ${fmt(amountsWei[i])} ETH: شبیه‌سازی OK`);
       } catch (e) {
         fail++;
-        journal.failed.push({ recipient: recipients[i], ethIn: amounts[i], error: (e.shortMessage ?? e.message).slice(0, 160) });
+        journal.failed.push({ recipient: recipients[i], error: (e.shortMessage ?? e.message).slice(0, 160) });
         console.log(`🧪❌ [${i + 1}/${recipients.length}] ${recipients[i]}: ریورت شبیه‌سازی — ${(e.shortMessage ?? e.message).slice(0, 100)}`);
       }
     }
@@ -381,6 +515,8 @@ async function main() {
   }
 
   for (let i = 0; i < recipients.length; i++) {
+    const target = recipients[i];
+    if (doneSet.has(target.toLowerCase())) { console.log(`   ⏭️ [${i + 1}/${recipients.length}] ${target} قبلاً خرید شده (resume)`); continue; }
     // ۱) گرجوئیشن رسید؟ (پیش‌فرض فعال)
     if (await gradReached(`pre-buy ${i + 1}`)) { stoppedBy = "graduation"; break; }
     // ۲) گارد خرید خارجی (هر checkEvery خرید یک‌بار + همیشه خرید اول) — خطای پیاپی RPC هم fail-closed توقف است
@@ -388,27 +524,13 @@ async function main() {
       const tripped = await guardCheck(`pre-buy ${i + 1}`);
       if (tripped) { stoppedBy = guard.errors >= 3 ? "guard-rpc-error" : "external-guard"; break; }
     }
-    const target = recipients[i];
-    const quoteIn = eth(amounts[i].toFixed(6));
-    const data = curveIface.encodeFunctionData("buy", [quoteIn, minOutFor(quoteIn), target]);
+    const quoteIn = amountsWei[i];
     try {
-      // ۳) شبیه‌سازی قبل از ارسال — محافظ اصلی: اگر ریورت کند ETH از دست نمی‌رود
-      await provider.call({ to: a.curve, data, value: quoteIn, from: payer.address });
-      gp = await gasPrice(); // گس‌پرایس تازه برای هر تراکنش
-      const tx = await payer.sendTransaction({ to: a.curve, data, value: quoteIn, gasPrice: gp });
-      const rc = await tx.wait(1, 120000);
-      let tokensOut = null;
-      for (const log of rc.logs) {
-        if (log.address.toLowerCase() === a.curve.toLowerCase() && log.topics[0] === CURVE_BUY_TOPIC) {
-          const ev = curveIface.parseLog({ topics: log.topics, data: log.data });
-          if (ev.args.recipient.toLowerCase() === target.toLowerCase()) tokensOut = ev.args.tokensOut;
-        }
-      }
-      results.push({ recipient: target, ethIn: amounts[i], tx: tx.hash, tokensOut: tokensOut?.toString() ?? null, block: rc.blockNumber });
-      J(); // ژورنال بعد از هر موفقیت
-      console.log(`✅ [${i + 1}/${recipients.length}] ${target} | ${amounts[i].toFixed(4)} ETH | توکن: ${tokensOut ? formatUnits(tokensOut, tokDec) : "?"} | بلاک ${rc.blockNumber} | ${tx.hash}`);
+      await refPrice();
+      const { tx } = await doSend(target, quoteIn);
+      await waitAndRecord(target, quoteIn, tx);
     } catch (e) {
-      journal.failed.push({ recipient: target, ethIn: amounts[i], error: (e.shortMessage ?? e.message).slice(0, 160) });
+      journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), error: (e.shortMessage ?? e.message).slice(0, 160) });
       J(); // حتی شکست‌ها هم ژورنال می‌شوند
       console.log(`❌ [${i + 1}/${recipients.length}] ${target}:`, (e.shortMessage ?? e.message).slice(0, 120));
       if (truthy(a["stop-on-error"])) { stoppedBy = "tx-error"; break; }
@@ -416,22 +538,23 @@ async function main() {
     if (i < recipients.length - 1) await sleep(perDelay);
   }
 
-  journal.stoppedBy = stoppedBy; J();
+  journal.stoppedBy = stoppedBy ?? "completed"; J();
 
-  if (stoppedBy) console.log(`⏹️ خریدها متوقف شدند — دلیل: ${{ graduation: "گرجوئیشن رسید", "external-guard": "گارد خرید خارجی", "guard-rpc-error": "خطای پیاپی RPC گارد", "tx-error": "خطای تراکنش" }[stoppedBy] ?? stoppedBy}`);
+  if (stoppedBy && stoppedBy !== "completed") console.log(`⏹️ خریدها متوقف شدند — دلیل: ${{ graduation: "گرجوئیشن رسید", "external-guard": "گارد خرید خارجی", "guard-rpc-error": "خطای پیاپی RPC گارد", "tx-error": "خطای تراکنش" }[stoppedBy] ?? stoppedBy}`);
 
-  console.log(`💾 ژورنال (${results.length}/${recipients.length} موفق، ${journal.failed.length} ناموفق): ${journalFile}`);
+  console.log(`💾 ژورنال (${results.length}/${recipients.length} موفق، ${journal.failed.length} ناموفق/تعلیق): ${journalFile}`);
 
-  if (!stoppedBy) {
+  if (!stoppedBy || stoppedBy === "completed") {
     console.log("\n— کنترل موجودی نهایی (از خود کانترکت توکن) —");
     for (const r of results) {
-      const b = await tokenRead.balanceOf(r.recipient);
-      console.log(`${r.recipient}: ${formatUnits(b, tokDec)}`);
+      try { console.log(`${r.recipient}: ${formatUnits(await tokenRead.balanceOf(r.recipient), tokDec)}`); } catch {}
     }
   } else {
-    console.log("⚠️ اجرا ناقص بود — ولت‌های بدون توکن در ژورنال مشخص‌اند؛ می‌توانی با همان لیست ادامه بدهی یا با panic خارج شوی.");
+    console.log("⚠️ اجرا ناقص بود — اجرای دوباره‌ی همین دستور خودکار RESUME می‌کند (خریدهای ماین‌شده دوباره‌کار نمی‌شوند).");
   }
+  const exitCode = journal.failed.length ? 2 : 0;
   releaseLock();
+  process.exit(exitCode);
 }
 
 main().catch((e) => { releaseLock(); console.error("خطا:", e.shortMessage ?? e.message); process.exit(1); });

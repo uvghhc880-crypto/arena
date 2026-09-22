@@ -12,8 +12,16 @@
 import { Contract, Wallet } from "ethers";
 import { env, parseArgs } from "./config.js";
 import { ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep } from "./lib.js";
-import { curveTrades, panicSellAll, median } from "./market.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep, uniqueSigners, legacyHd } from "./lib.js";
+import { curveTrades, panicSellAll, median, marketPrice } from "./market.js";
+
+// ─── فرمول سود (اصلاح‌شده‌ی ممیزی ۲): بازده کل = (عایدی فروش‌های قبلی + ارزش خالص فعلی) نسبت به کل خرید ───
+// قبلاً عایدی از مبنا کم می‌شد و سود فقط روی مبنای باقی‌مانده — تریگر زودهنگام (مثال: خرید ۱۰۰، فروش ۶۰،
+// ارزش باقی‌مانده ۸۰ ⇒ سود واقعی ۴۰٪ ولی فرمول قدیمی ۱۰۰٪ گزارش می‌داد).
+export function profitTotalPct(spentEth, proceedsEth, realizedNetEth) {
+  if (!(spentEth > 0)) return realizedNetEth + proceedsEth > 0 ? Infinity : 0;
+  return ((proceedsEth + realizedNetEth) - spentEth) / spentEth * 100;
+}
 
 async function resolveFromBlock(a) {
   if (a["launch-tx"]) {
@@ -44,6 +52,8 @@ async function main() {
   --worker-start 0         offset مشتق‌گیری کارگرها (با batch-buy هماهنگ نگه دار)
   --self-extra 0x..,0x..    آدرس‌های خودیِ اضافی (فقط رصد؛ امضا ندارند)
   --concurrency 6          هم‌زمانی خروج موازی
+  --panic-max-attempts 8   پس از این تعداد پنیکِ ناقص، با کد ۲ و لیست ولت‌های دارای موجودی خارج می‌شود
+  --legacy-hd              مسیر قدیمی اشتباه HD (فقط بازیابی لانچ‌های قبل از اصلاح BIP44)
   --max-minutes 0          سقف زمان اجرا (۰ = بی‌نهایت)`);
     process.exit(1);
   }
@@ -58,18 +68,23 @@ async function main() {
   const interval = Number(a["interval-ms"] ?? 1200);
   const concurrency = Math.max(1, Number(a["concurrency"] ?? 6));
   const maxMin = Number(a["max-minutes"] ?? 0);
+  const maxPanicAttempts = Math.max(1, Number(a["panic-max-attempts"] ?? 8));
+  let panicAttempts = 0;
 
-  // امضاکننده‌ها (کریتور + کارگرها + payer) — مبنای سرمایه/دارایی/خروج
+  // امضاکننده‌ها (کریتور + کارگرها + payer) — مبنای سرمایه/دارایی/خروج — یونیک می‌شوند (تصادم nonce!)
   const signerSet = new Set();
-  const signers = [masterWallet()];
+  const legacy = legacyHd(a);
+  const all = [masterWallet()];
   const wc = Number(env("WORKER_COUNT", "28"));
   const wStart = workerStart(a);
-  try { signers.push(...deriveWorkers(wc, wStart).map((w) => w.wallet)); } catch {
+  try { all.push(...deriveWorkers(wc, wStart, { legacy }).map((w) => w.wallet)); } catch {
     console.warn("⚠️ MNEMONIC تنظیم نشده — فقط کریتور رصد/خروج می‌شود");
   }
   const payerPk = env("BATCH_PAYER_PRIVATE_KEY");
-  if (payerPk) { try { const w = new Wallet(payerPk, provider); signers.push(w); } catch {} }
+  if (payerPk) { try { all.push(new Wallet(payerPk, provider)); } catch {} }
+  const signers = uniqueSigners(all);
   signers.forEach((s) => signerSet.add(s.address.toLowerCase()));
+  if (legacy) console.log("🕰️ حالت --legacy-hd: مسیر قدیمی اشتباه (m/44'/60'/0'/0/0/i) برای بازیابی ولت‌های لانچ‌های پیشین");
   // خودیِ رصد-فقط (بدون کلید): نه در مبنای سرمایه نه در دارایی — فقط نمایش لاگ
   const monitorSet = new Set();
   (a["self-extra"] ?? "").split(",").map((s) => s.trim()).filter((s) => s.startsWith("0x"))
@@ -91,8 +106,8 @@ async function main() {
       // ۱) معاملات تازه — برای سرمایه، فلوت و قیمت (همه از یک اسکن)
       const trades = await curveTrades(a.curve, fromBlock);
 
-      // ۲) مبنای سرمایه: جمع خریدهای امضاکننده‌ها منهای بازپس‌گیری‌های آن‌ها (فروش‌های خودی)
-      //    → فروش‌های جزئی پیشین، مبنا را کم می‌کنند (رفع اشکال «سرمایه‌ی تاریخی انباشته»)
+      // ۲) سرمایه و عایدی: کل خریدهای خودی (spent) ثابت است؛ عایدی فروش‌های خودی (proceeds) جمع می‌شود.
+      //    سود = بازده کل: (عایدی قبلی + ارزش خالص فروش موجودی فعلی) − کل خرید  ⟵ فرمول اصلاح‌شده
       let spent = 0n, selfProceeds = 0n, monitorBuys = 0n;
       const selfBuyWallets = new Set();
       for (const t of trades) {
@@ -103,9 +118,8 @@ async function main() {
           selfProceeds += t.quote;
         }
       }
-      const basis = spent > selfProceeds ? spent - selfProceeds : 0n;
       const spentEth = Number(fmt(spent));
-      const basisEth = Number(fmt(basis));
+      const proceedsEth = Number(fmt(selfProceeds));
       if (!(spentEth > 0)) { console.log("— هنوز خرید خودی‌ای دیده نمی‌شود — صبر…"); await sleep(interval); continue; }
 
       // ۳) موجودی زنده‌ی توکن خودی‌ها
@@ -135,34 +149,45 @@ async function main() {
       } else {
         fillFactor = 1 - impactFixed;
       }
-      const realized = mark * fillFactor * feeFactor;
-      // اگر مبنا صفر است (سرمایه کاملاً برگشته) — هر مارک مثبت = سود بی‌نهایت (house money) → تریگر فوری
-      const profitPct = basisEth > 0 ? (realized - basisEth) / basisEth * 100 : (realized > 0 ? Infinity : 0);
-      // ضریب مارک لازم برای رسیدن دقیق به آستانه (نسبت به مبنا)
-      const reqMarkMult = neededMult / (fillFactor * feeFactor);
+      const realized = mark * fillFactor * feeFactor; // ارزش خالص فروش موجودی فعلی (پس از ایمپکت/فی)
+      // فرمول اصلاح‌شده: سود = بازده کل = (proceeds قبلی + realized فعلی) نسبت به کل خرید (spent)
+      const profitPct = profitTotalPct(spentEth, proceedsEth, realized);
+      // ضریب مارک لازم: به ازای مختلفِ آن: requiredMark = (spent×ضریب‌هدف − proceeds)/ایمپکت×فی
+      const requiredMark = (spentEth * neededMult - proceedsEth) / (fillFactor * feeFactor);
+      const reqMarkMult = mark > 0 ? requiredMark / mark : Infinity;
 
       const selfShow = Number(fmt(totTokensWei)).toLocaleString("fa-IR", { maximumFractionDigits: 0 });
       const floatShow = Number(fmt(floatWei)).toLocaleString("fa-IR", { maximumFractionDigits: 0 });
       const monitorTag = monitorSet.size && monitorBuys > 0n ? ` | 👁️ رصد-فقط خرید: ${Number(fmt(monitorBuys)).toFixed(3)}` : "";
-      console.log(`💰 مبنا ${basisEth.toFixed(4)} ETH${spent > basis ? ` (پرداخت ${spentEth.toFixed(4)} − بازپس‌گیری ${Number(fmt(selfProceeds)).toFixed(4)})` : ""} (${selfBuyWallets.size} ولت)${monitorTag} | 📈 خودی ${selfShow} / فلوت ${floatShow} | ضریب مارک ${(basisEth > 0 ? mark / basisEth : 0).toFixed(2)}× (لازم: ${reqMarkMult.toFixed(2)}×) | پرشدنی ×${fillFactor.toFixed(3)} | دریافتی خالص ~${realized.toFixed(4)} ETH | سود ${profitPct === Infinity ? "∞" : profitPct.toFixed(0)}٪ / آستانه ${minProfitPct}٪`);
+      console.log(`💰 خرج ${spentEth.toFixed(4)} ETH | عایدی قبلی ${proceedsEth.toFixed(4)} (${selfBuyWallets.size} ولت)${monitorTag} | 📈 خودی ${selfShow} / فلوت ${floatShow} | ضریب مارک ${(spentEth > 0 ? mark / spentEth : 0).toFixed(2)}× (لازم: ${reqMarkMult === Infinity ? "∞" : reqMarkMult.toFixed(2)}×) | پرشدنی ×${fillFactor.toFixed(3)} | ارزش خالص فعلی ~${realized.toFixed(4)} | بازده کل ~${(proceedsEth + realized).toFixed(4)} | سود ${profitPct === Infinity ? "∞" : profitPct.toFixed(0)}٪ / آستانه ${minProfitPct}٪`);
 
       if (profitPct >= minProfitPct) {
         console.log(`\n🎯 هدف رسید: سود خالص پس از ایمپکت = ${profitPct === Infinity ? "∞" : profitPct.toFixed(0) + "٪"} ≥ ${minProfitPct}٪ — خروج موازی کامل الان!\n`);
         let before = 0n;
         for (const s of signers) { try { before += await provider.getBalance(s.address); } catch {} }
         const gp = await gasPrice();
-        const pres = await panicSellAll(a.token, a.curve, signers, gp, concurrency, { estPrice: price, slippageBps });
+        // anchor: قیمت آخرین معامله واقعی — نزدیک‌تر به پرشدنی تا minOut واقع‌بینانه باشد
+        let anchorPrice = price;
+        try { const mp = await marketPrice(a.curve, fromBlock, k); anchorPrice = mp?.last ?? mp?.price ?? price; } catch {}
+        const pres = await panicSellAll(a.token, a.curve, signers, gp, concurrency, { estPrice: anchorPrice, slippageBps });
         await sleep(2500);
         let after = 0n;
         for (const s of signers) { try { after += await provider.getBalance(s.address); } catch {} }
         const received = Number(fmt(after - before));
-        const realizedFinal = basisEth > 0 ? received / basisEth : 0;
         if (pres.fail > 0) {
-          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق — با sell.js یا دستی تکمیل کن؛ ژورنال بالا راهنماست`);
-        } else {
-          console.log(`💵 دریافتی واقعی پس از خروج (دلتای ETH منهای گس): ${received.toFixed(4)} ETH${basisEth > 0 ? ` = ${realizedFinal.toFixed(2)}× مبنا (سود واقعی ${((realizedFinal - 1) * 100).toFixed(0)}٪)` : ""}`);
-          if (basisEth > 0 && realizedFinal < neededMult) console.log(`⚠️ پرشدنی واقعی زیر مدل آمد (${realizedFinal.toFixed(2)} < ${neededMult.toFixed(2)}) — تخفیف/فی را محافظه‌کارتر کن`);
+          panicAttempts++;
+          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق (تلاش ${panicAttempts}/${maxPanicAttempts}) — چرخه‌ی رصد ادامه دارد و ولت‌های باقی‌مانده دوباره پنیک می‌شوند…`);
+          if (panicAttempts >= maxPanicAttempts) {
+            const left = [];
+            for (const s of signers) { try { if ((await token.balanceOf(s.address)) > 0n) left.push(s.address); } catch {} }
+            console.log(`⛔ خروج پس از ${maxPanicAttempts} تلاش کامل نشد. ولت‌های دارای موجودی:\n${left.join("\n")}\nاقدام دستی: sell.js یا (پس از گرجوئیشن) --ur-data مستقیم برای این ولت‌ها`);
+            process.exitCode = 2;
+            return;
+          }
+          continue; // رصد ادامه دارد — توقفِ monitoring ناقص خروج دیگر
         }
+        console.log(`💵 بازده کل واقعی پس از خروج (عایدی قبلی + دلتای این خروج): ${(proceedsEth + received).toFixed(4)} ETH${spentEth > 0 ? ` = ${((proceedsEth + received) / spentEth).toFixed(2)}× سرمایه (سود واقعی ${(((proceedsEth + received) / spentEth - 1) * 100).toFixed(0)}٪)` : ""}`);
+        if (spentEth > 0 && (proceedsEth + received) / spentEth < neededMult) console.log(`⚠️ پرشدنی واقعی زیر مدل آمد (${((proceedsEth + received) / spentEth).toFixed(2)} < ${neededMult.toFixed(2)}) — تخفیف/فی را محافظه‌کارتر کن`);
         return;
       }
     } catch (e) {
@@ -172,4 +197,5 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error("خطا:", e.shortMessage ?? e.message); process.exit(1); });
+// اجرا فقط به‌صورت مستقیم CLI — هنگام import (مثلاً تست‌ها) تابع‌های خالص بدون اجرای main صادر می‌شوند
+if (import.meta.url === `file://${process.argv[1]}`) main().catch((e) => { console.error("خطا:", e.shortMessage ?? e.message); process.exit(1); });

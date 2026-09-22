@@ -6,7 +6,7 @@ import path from "node:path";
 import { Contract, ethers } from "ethers";
 import { ADDR, CHAIN, LAUNCHES_DIR, env, parseArgs } from "./config.js";
 import { LAUNCH_AND_BUY_ABI } from "./abis.js";
-import { masterWallet, claimerWallet, deriveWorkers, workerStart, truthy, eth, fmt, nowTag, provider, normalizeBytes32 } from "./lib.js";
+import { masterWallet, claimerWallet, deriveWorkers, workerStart, truthy, eth, fmt, nowTag, provider, normalizeBytes32, atomicWriteJson } from "./lib.js";
 
 const FACTORY_V2_ABI = [
   "function launchToken((string name, string symbol, string logo, string description, (string twitter, string telegram, string discord, string website, string farcaster) socials, address creatorFeeRecipient, uint16 creatorTaxBps, bool buybackEnabled, bytes32 expectedEconomics, bytes32 salt) params, address pairToken, address factoryRef) payable",
@@ -59,7 +59,9 @@ async function main() {
     snipeTaxExemptions = workers.map((w) => w.address);
   }
 
-  const minOut = a["min-out"] ? BigInt(a["min-out"]) : 0n;
+  const minOut = a["min-out"] !== undefined ? BigInt(a["min-out"]) : 0n;
+  if (minOut === 0n)
+    console.warn("⚠️ خرید اولیه‌ی لانچ با minOut=0 انجام می‌شود — چون لیکوییدیتی قبلی وجود ندارد این پیش‌فرضِ الگوی فارم است؛ اگر می‌خواهی از slippage‌ای غیرمنتظره محافظت شوی --min-out <wei> بده.");
 
   // salt: هگز (هر طولی) → zeroPad به ۳۲ بایت؛ عدد → تبدیل به ۳۲ بایت
   let salt = ethers.ZeroHash;
@@ -178,7 +180,7 @@ async function main() {
     createdAt: new Date().toISOString(),
   };
   const file = path.join(LAUNCHES_DIR, `launch_${nowTag()}_${safeName(symbol)}.json`);
-  fs.writeFileSync(file, JSON.stringify(record, null, 2));
+  atomicWriteJson(file, record); // نوشتن اتمیک — کرش موازی فایل را نیمه‌کاره نگذارد
   console.log("🎉 پایان لانچ:", tokenAddr ? `token=${tokenAddr} curve=${curveAddr ?? "?"} tokensOut=${tokensOut ? tokensOut.toString() : "?"}` : "آدرس توکن null (رکورد را دستی تکمیل کن)");
   console.log("📄 رکورد:", file);
 }

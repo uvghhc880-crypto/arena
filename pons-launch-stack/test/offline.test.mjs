@@ -5,15 +5,23 @@ delete process.env.WORKER_START;
 
 import { isAddress, formatUnits, parseUnits, HDNodeWallet, zeroPadValue } from "ethers";
 
+import fs from "node:fs";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
+
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log("PASS  " + name); } else { fail++; console.log("FAIL  " + name); } };
 
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const lib = await import("../src/lib.js");
 const mkt = await import("../src/market.js");
 const cfg = await import("../src/config.js");
 const abis = await import("../src/abis.js");
-const { deriveWorkers, workerStart, splitRandom, truthy, numOpt } = lib;
+const exitModule = await import("../src/exit.js");
+const { deriveWorkers, workerStart, splitRandom, splitWeiRandom, uniqueSigners, truthy, numOpt, atomicWriteJson, readJsonSafe } = lib;
 const { median, estMinOut } = mkt;
+const LAUNCHES_DIR = cfg.LAUNCHES_DIR ?? `${ROOT}/launches`;
+const LOCK = `${LAUNCHES_DIR}/batch_buy.lock`;
 
 // ─── ۱) مسیر HD استاندارد BIP44 (بردار مرجع رسمی هارد‌هت) ───
 {
@@ -136,6 +144,107 @@ ok("workerStart فلگ>env>۰", (() => { const a = workerStart({ "worker-start":
 // ─── ۱۰) isAddress و formatUnits ───
 ok("isAddress", isAddress("0xe33e9e479df8802cb0866d5d05258bec4cf62948") && !isAddress("0xGGGG") && !isAddress("0x1234"));
 ok("formatUnits", formatUnits(parseUnits("1234.5", 6), 6) === "1234.5");
+
+// ═══════════════ ممیزی ۲ — تست ادعاهای جدید ═══════════════
+
+// ─── ۱۱) لاک: اجرای خطادار لاک مالک دیگر را پاک نمی‌کند (بازتولید دقیق ادعای ممیزی) ───
+{
+  const { spawnSync } = await import("node:child_process");
+  fs.mkdirSync(LAUNCHES_DIR, { recursive: true });
+  fs.writeFileSync(LOCK, JSON.stringify({ pid: 999999, token: "FOREIGN-OWNER-999", at: "x" }));
+  const r = spawnSync("node", ["src/batch_buy.js"], { cwd: ROOT }); // بدون آرگومان ⇒ خطا و خروج
+  ok("اجرای بدون آرگومان exit≠0", r.status !== 0);
+  const survived = fs.existsSync(LOCK) && fs.readFileSync(LOCK, "utf8").includes("FOREIGN-OWNER-999");
+  ok("لاک مالک خارجی دست‌نخورده ماند (رفع باگ بحرانی لاک)", survived);
+  fs.rmSync(LOCK, { force: true });
+}
+
+// ─── ۱۲) فرمول سود exit — مثال دقیق ممیزی ───
+{
+  ok("exit import شد (main اجرا نمی‌شود)", typeof exitModule.profitTotalPct === "function");
+  const P = exitModule.profitTotalPct;
+  // خرید ۱۰۰، فروش قبلی ۶۰، ارزش باقی‌مانده ۸۰ ⇒ سود واقعی ۴۰٪ (قبلاً اشتباه ۱۰۰٪ گزارش می‌شد)
+  ok("فرمول: ۱۰۰/۶۰/۸۰ ⇒ +۴۰٪ نه +۱۰۰٪", Math.abs(P(100, 60, 80) - 40) < 1e-9);
+  ok("تریگر آستانه ۱۰۰ در مثال ممیزی شلیک نمی‌شود", P(100, 60, 80) < 100);
+  ok("۱۰۰/۶۰/۱۴۰ ⇒ +۱۰۰٪ (تریگر درست)", Math.abs(P(100, 60, 140) - 100) < 1e-9);
+  ok("۱۰۰/۶۰/۱۲۰ ⇒ ۸۰٪ < ۱۰۰", Math.abs(P(100, 60, 120) - 80) < 1e-9);
+  ok("spent=0 و ارزش>0 ⇒ ∞ (house money)", P(0, 0, 5) === Infinity);
+}
+
+// ─── ۱۳) splitWeiRandom — تخصیص دقیق BigInt ───
+{
+  const E = (x) => parseUnits(String(x), 18);
+  // مثال ممیزی: 0.001 بین ۲۸ با مین 0.0005 ⇒ غیرممکن ⇒ باید throw (نه سهم 0.0000357!)
+  let threw = 0;
+  try { splitWeiRandom(E(0.001), 28, E(0.0005)); } catch { threw++; }
+  ok("۰٫۰۰۱÷۲۸ با مین ۰٫۰۰۰۵ ⇒ throw (به‌جای سهم زیرمین)", threw === 1);
+  for (let t = 0; t < 50; t++) {
+    const n = 1 + Math.floor(Math.random() * 28);
+    const minW = E(0.0005), totalW = E(0.0005 * n + Math.random() * 2);
+    const s = splitWeiRandom(totalW, n, minW);
+    const sum = s.reduce((a, b) => a + b, 0n);
+    if (!(s.length === n && s.every((x) => x >= minW) && sum === totalW)) { ok(`splitWeiRandom خاصیت‌ها (iter ${t})`, false); }
+  }
+  ok("splitWeiRandom ۵۰ آزمایش: جمع دقیق + همه ≥ مین", true);
+  const one = splitWeiRandom(E(1.5), 1, E(0.0005));
+  ok("n=1 کل مبلغ", one.length === 1 && one[0] === E(1.5));
+}
+
+// ─── ۱۴) بردار legacy HD (مسیر قدیمی اشتباه — بازیابی) ───
+{
+  const legacy0 = deriveWorkers(1, 0, { legacy: true })[0].address;
+  ok("legacy idx0 == آدرس مسیر اشتباه قدیمی (0xD51d…)", legacy0 === "0xD51d4b680Cd89E834413c48fa6EE2c59863B738d");
+  const bip0 = deriveWorkers(1, 0)[0].address;
+  ok("legacy ≠ BIP44", legacy0 !== bip0);
+}
+
+// ─── ۱۵) uniqueSigners ───
+{
+  const w = deriveWorkers(1, 0)[0].wallet;
+  const before = console.warn; let warned = 0; console.warn = () => warned++;
+  const uniq = uniqueSigners([w, w]);
+  console.warn = before;
+  ok("uniqueSigners تکراری را حذف + هشدار می‌دهد", uniq.length === 1 && warned === 1);
+}
+
+// ─── ۱۶) estMinOut Q64 — دقت در مقادیر بزرگ/کوچک ───
+{
+  // فروش: 6e24 خام × 1e9 wei/خام × ۹۲٪ — مقدار float از ۲⁵³ می‌گذرد (نسخه‌ی قدیمی ازدست‌دقت داشت)
+  const amount = 6n * 10n ** 24n, big = estMinOut(amount, 1e9, 800);
+  const expected = (amount * BigInt(1e9) * 9200n) / 10000n; // محاسبه‌ی مرجع صحیح
+  ok("estMinOut Q64 == مقدار مرجع صحیح (عدد بزرگ)", big === expected);
+  // نسخه‌ی float قدیمی روی همین ورودی خطای قابل‌توجه می‌داد:
+  const floatOld = BigInt(Math.floor(Number(amount) * 1e9 * 0.92));
+  ok("Q64 دقیق‌تر از float قدیمی است", (big - expected) === 0n && (floatOld - expected) !== 0n);
+  ok("estMinOut anchor غلبه می‌کند", estMinOut(1000n, 1e9, 800, { anchor: 2e9 }) === 1_840_000_000_000n);
+  ok("estMinOut قیمت صفر ⇒ ۰", estMinOut(1000n, null, 800, { anchor: 0 }) === 0n || estMinOut(1000n, null, 800, { anchor: null }) === 0n);
+}
+
+// ─── ۱۷) numOpt با int ───
+{ let threw = 0; try { numOpt("1.5", 0, { int: true, name: "pct" }); } catch { threw++; } ok("numOpt int: 1.5 رد (رفع کرش BigInt)", threw === 1); }
+ok("numOpt int: '50' قبول", numOpt("50", 0, { int: true, name: "pct" }) === 50);
+
+// ─── ۱۸) ژورنال اتمیک + بازیابی .bak ───
+{
+  const tmp = `${os.tmpdir()}/journal_test_${process.pid}.json`;
+  atomicWriteJson(tmp, { header: { x: 1 }, results: [] }); // نسخه‌ی اول
+  const a1 = readJsonSafe(tmp);
+  ok("atomicWrite/read رفت‌وبرگشت", a1.header.x === 1);
+  atomicWriteJson(tmp, { header: { x: 2 }, results: [] }); // نسخه‌ی دوم ⇒ نسخه‌ی اول به .bak می‌رود (معنای واقعی .bak)
+  fs.writeFileSync(tmp, "{CORRUPT-JSON"); // شبیه‌سازی کرش نیمه‌کاره روی نسخه‌ی جدید
+  const a2 = readJsonSafe(tmp); // باید از .bak (نسخه‌ی اول) برگردد
+  ok("خرابی ⇒ بازیابی از .bak", a2.header.x === 1);
+  let threw = 0; fs.writeFileSync(tmp, "{CORRUPT"); fs.rmSync(`${tmp}.bak`, { force: true });
+  try { readJsonSafe(tmp); } catch { threw++; }
+  ok("خراب هردو ⇒ خطای صریح (نه بازگشت خاموش به خالی)", threw === 1);
+  fs.rmSync(tmp, { force: true });
+}
+
+// ─── ۱۹) deriveWorkers با legacy در workerStart آفست ───
+{
+  const leg = deriveWorkers(2, 5, { legacy: true });
+  ok("legacy با آفست سازگار است", leg.every((w, i) => w.index === 5 + i));
+}
 
 console.log(`\n————— نتیجه: ${pass} PASS، ${fail} FAIL —————`);
 process.exit(fail > 0 ? 1 : 0);

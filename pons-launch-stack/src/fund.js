@@ -94,8 +94,22 @@ async function main() {
       if (entry && !force) {
         // وریفای آنچین: وضعیت واقعی مرجع است نه متن ژورنال
         let st = entry.tx ? await classifyTx(entry.tx, { polls: 1 }) : "absent";
+        if (st === "pending" || st === "unknown") {
+          // تعلیق ⇒ هرگز resend: ابتدا تعیین‌تکلیف (تا ۹۰ ثانیه)، سپس دوباره داوری
+          const t0 = Date.now();
+          while ((st === "pending" || st === "unknown") && Date.now() - t0 < 90000) {
+            console.log(`   ⏳ ${w.address}: تراکنش «${st}» — منتظر تعیین‌تکلیف…`);
+            await sleep(10000);
+            st = await classifyTx(entry.tx, { polls: 1 });
+          }
+          if (st === "pending" || st === "unknown") {
+            console.log(`   ⛔ ${w.address}: تراکنش همچنان «${st}» است — resend در این اجرا انجام نمی‌شود (ابتدا دستی تعیین‌تکلیف کن)`);
+            failCount++;
+            continue;
+          }
+        }
         if (st === "ok") { console.log(`   ⏭️ ${w.address}: تأییدشده در زنجیره (${entry.tx.slice(0, 12)}…) — رد شد`); skipCount++; continue; }
-        // تراکنش نامشخص/ریورت‌شده → چک موجودی فعلی: شاید مسیر دیگری شارژ شده
+        // تراکنش ریورت‌شده/ثبت‌نشده → چک موجودی فعلی: شاید مسیر دیگری شارژ شده
         try {
           const b = await provider.getBalance(w.address);
           const need = entry.valueWei ? BigInt(entry.valueWei) : amountsWei[i];
@@ -111,6 +125,9 @@ async function main() {
       const gp = await gasPrice();
       try {
         const tx = await master.sendTransaction({ to: w.address, value, gasPrice: gp });
+        // ← ثبت «نیت» بلافاصله بعد از broadcast: کرش اینجا رسید نمی‌سازد ولی هش در ژورنال است
+        journal.entries[w.address] = { valueWei: value.toString(), tx: tx.hash, at: new Date().toISOString(), state: "broadcast" };
+        saveJournal(journal);
         try {
           await tx.wait(1, 120000);
         } catch (e) {

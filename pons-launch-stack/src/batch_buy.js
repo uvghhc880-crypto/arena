@@ -360,7 +360,8 @@ async function main() {
   const minShareWei = weiOf(minShareEth);
   let resolvedAlloc = null;
   try {
-    const r = resolveBatchAllocation({ journal: existing, fresh, recipients, totalWei, minShareWei, dryRun });
+    // dry-run همان محدودیت min-share واقعی را می‌سنجد (dryRun:false برای allocation — parity کامل با اجرای واقعی)
+    const r = resolveBatchAllocation({ journal: existing, fresh, recipients, totalWei, minShareWei, dryRun: false });
     if (!r.ok) { console.log(`⛔ نقشه‌ی تخصیص ژورنال با recipientهای این اجرا یکی نیست — resume غیرامن. یا همان لیست را بده یا --fresh.`); REL(); process.exit(1); }
     amountsWei = r.amountsWei;
     if (r.source === "frozen") console.log(`♻️ resume با نقشه‌ی تخصیص منجمد‌شده‌ی ژورنال (مجموع ${existing.alloc.totalEth} ETH — همان اجرای اول)`);
@@ -476,6 +477,11 @@ async function main() {
   }
 
   async function waitAndRecord(target, quoteIn, tx) {
+    // ← ثبت «نیت» بلافاصله بعد از broadcast: اگر الان کرش کنیم، هشِ معلقِ ما در ژورنال است و resume تعیین‌تکلیفش می‌کند
+    journal.failed = (journal.failed ?? []).filter((e) => e.tx !== tx.hash);
+    journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, status: "broadcast", intent: true, at: new Date().toISOString() });
+    J();
+    const dropIntent = () => { journal.failed = journal.failed.filter((e) => !(e.tx === tx.hash && e.intent)); };
     try {
       const rc = await tx.wait(1, 120000);
       let tokensOut = null;
@@ -485,6 +491,7 @@ async function main() {
           if (ev.args.recipient.toLowerCase() === target.toLowerCase()) tokensOut = ev.args.tokensOut;
         }
       }
+      dropIntent();
       results.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, tokensOut: tokensOut?.toString() ?? null, block: rc.blockNumber });
       J();
       console.log(`✅ ${target} | ${fmt(quoteIn)} ETH | توکن: ${tokensOut ? formatUnits(tokensOut, tokDec) : "?"} | بلاک ${rc.blockNumber} | ${tx.hash}`);
@@ -493,11 +500,13 @@ async function main() {
       console.log(`⚠️ دریافت رسید ممکن نشد (${(e.shortMessage ?? e.message).slice(0, 80)}) — پرس‌وجوی وضعیت ${tx.hash}…`);
       const st = await classifyTx(tx.hash, { polls: 3, intervalMs: 5000 });
       if (st === "ok") {
+        dropIntent();
         results.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, tokensOut: null, recovered: true });
         J();
         console.log(`✅ تراکنش در واقع ماین شد (پس از قطعی) — ثبت موفق: ${tx.hash}`);
         return "ok";
       }
+      dropIntent();
       journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, pending: st === "pending", status: st, error: `tx ${st}: ${(e.shortMessage ?? e.message).slice(0, 120)}` });
       J();
       if (st === "pending" || st === "unknown") {

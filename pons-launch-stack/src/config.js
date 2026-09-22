@@ -6,14 +6,31 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 
-// پارس ساده‌ی .env
+// پارس ساده‌ی .env — با چک fail-closed امنیت فایل (ممیزی ۳):
+// لینک-سمبلیک یا مالک متفاوت یا پرمیشن باز ⇒ abort؛ با ALLOW_WEAK_ENV=1 صریحاً قابل‌غلبه است.
 (function loadEnv() {
   const envPath = path.join(ROOT, ".env");
   if (!fs.existsSync(envPath)) return;
+  const weakOk = process.env.ALLOW_WEAK_ENV === "1";
   try {
+    const lst = fs.lstatSync(envPath);
+    if (lst.isSymbolicLink() && !weakOk) {
+      console.error("⛔ .env یک symbolic link است — به دلایل امنیتی اجرا متوقف شد. (ALLOW_WEAK_ENV=1 برای غلبه‌ی صریح)");
+      process.exit(1);
+    }
     const st = fs.statSync(envPath);
-    if (st.mode & 0o077) console.warn("⚠️ پرمیشن .env باز است — `chmod 600 .env` بزن تا کلیدها فقط برای خودت خوانا شوند");
-  } catch {}
+    if (typeof process.getuid === "function" && st.uid !== process.getuid() && st.uid !== 0 && !weakOk) {
+      console.error(`⛔ مالک .env (${st.uid}) کاربر فعلی (${process.getuid()}) نیست — اجرا متوقف شد. (ALLOW_WEAK_ENV=1)`);
+      process.exit(1);
+    }
+    if (st.mode & 0o077) {
+      if (weakOk) console.warn("⚠️ پرمیشن .env باز است و با ALLOW_WEAK_ENV=1 پذیرفتید — `chmod 600 .env` بهتر است");
+      else {
+        console.error("⛔ پرمیشن .env باز است (خوانایی group/other) — ابتدا `chmod 600 .env` بزن. (ALLOW_WEAK_ENV=1 برای غلبه)");
+        process.exit(1);
+      }
+    }
+  } catch (e) { if (e.code !== "ENOENT") throw e; }
   for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
     if (!m || m[1].startsWith("#")) continue;

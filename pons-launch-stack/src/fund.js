@@ -4,9 +4,10 @@
 import fs from "node:fs";
 import { Wallet, isAddress } from "ethers";
 import { WALLETS_OUT, CHAIN, env, parseArgs } from "./config.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, legacyHd, eth, fmt, gasPrice, weiOf, splitWeiRandom, sleep, nowTag, atomicWriteJson, readJsonSafe, classifyTx } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, legacyHd, eth, fmt, gasPrice, weiOf, splitWeiRandom, sleep, nowTag, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock } from "./lib.js";
 
 const FUND_JOURNAL = `${WALLETS_OUT}/fund_journal.json`;
+const FUND_LOCK = `${WALLETS_OUT}/fund.lock`;
 
 // ژورنال جدید: { meta: {chainId, master, program}, entries: { addr: {valueWei, tx, at, state} } }
 // مهاجرت خودکار از فرمت قدیمی (map ساده addr → entry)
@@ -54,7 +55,9 @@ async function main() {
     // شارژ گس کارگرها — خرید باندل کار batch_buy/payer است، این‌جا فقط گس (~0.06 مجموعاً) کافی است
     const total = Number(a.total ?? "0.06");
     if (!Number.isFinite(total) || total <= 0) { console.log("⛔ --total نامعتبر است"); process.exit(1); }
-    const workers = deriveWorkers(Number(a.workers ?? env("WORKER_COUNT", "28")), workerStart(a));
+    // ⚠️ باگ ممیزی ۳ بود: --legacy-hd اینجا از chakra به deriveWorkers نمی‌رسید و پول به ولت‌های BIP44 جدید می‌رفت
+    const workers = deriveWorkers(Number(a.workers ?? env("WORKER_COUNT", "28")), workerStart(a), { legacy });
+    if (legacy) console.log("🕰️ --legacy-hd فعال: ولت‌های مقصد = مسیر قدیمی اشتباه (فقط بازیابی لانچ‌های پیشین)");
     const totalWei = weiOf(total);
     const minShareWei = a["min-share"] ? weiOf(Number(a["min-share"])) : 0n;
     let amountsWei;
@@ -81,6 +84,8 @@ async function main() {
       console.log(`⛔ موجودی مستر کافی نیست: ${fmt(bal)} ETH < ${total + 0.005} ETH`);
       process.exit(1);
     }
+    // run-lock: دو فرایند fund هم‌زمان ممنوع (مشابه batch_buy)
+    acquireRunLock(FUND_LOCK, { force, forceLivePid: truthy(a["force-live-pid"]) });
 
     let okCount = 0, skipCount = 0, failCount = 0;
     for (let i = 0; i < workers.length; i++) {
@@ -130,6 +135,7 @@ async function main() {
       await sleep(200);
     }
     console.log(`\n✔️ پایان شارژ: ${okCount} ارسال، ${skipCount} رد (قبلاً شارژ)، ${failCount} ناموفق/نامعلوم — ژورنال: ${FUND_JOURNAL}`);
+    releaseRunLock(FUND_LOCK);
     process.exitCode = failCount > 0 ? 1 : 0;
     return;
   }

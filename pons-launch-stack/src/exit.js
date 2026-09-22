@@ -100,9 +100,37 @@ async function main() {
   console.log("   (مبنای سرمایه = جمع خریدهای خودی منهای فروش‌های خودی — هر چرخه از رویدادهای تازه)");
 
   const t0 = Date.now();
+  let exiting = false; // ماشین‌حالت: وقتی خروج شروع شود، تا تعیین‌تکلیف همه‌ی ولت‌ها ادامه دارد — مستقل از شرط سود
   while (true) {
     if (maxMin > 0 && (Date.now() - t0) / 60000 > maxMin) { console.log("⌛ پایان پنجره‌ی زمانی بدون تریگر"); return; }
     try {
+      // ── فاز تخلیه (پس از شروع خروج): شرط سود دیگر معنا ندارد؛ فقط ولت‌های دارای توکن می‌مانند ──
+      if (exiting) {
+        let totalLeft = 0n;
+        const holders = [];
+        for (const s of signers) {
+          try { const b = await token.balanceOf(s.address); if (b > 0n) { totalLeft += b; holders.push(s); } } catch {}
+        }
+        if (holders.length === 0) {
+          console.log("\n✅ تخلیه‌ی کامل تأیید شد (موجودی توکن همه‌ی امضاکنندگان صفر است).");
+          return;
+        }
+        panicAttempts++;
+        console.log(`🔁 تخلیه ادامه دارد (تلاش ${panicAttempts}/${maxPanicAttempts}): ${holders.length} ولت هنوز توکن دارند…`);
+        if (panicAttempts > maxPanicAttempts) {
+          console.log(`⛔ خروج پس از ${maxPanicAttempts} تلاش کامل نشد. ولت‌های دارای موجودی:\n${holders.map((h) => h.address).join("\n")}\nاقدام دستی: sell.js یا (پس از گرجوئیشن) --ur-data مستقیم برای این ولت‌ها`);
+          process.exitCode = 2;
+          return;
+        }
+        // minOut تخلیه: اگر قیمت پیدا شود محافظت می‌کنیم، وگرنه صریح warning می‌گذرد (در panic اجباری نیست)
+        let anchorPrice2 = null;
+        try { const mp = await marketPrice(a.curve, fromBlock, k); anchorPrice2 = mp?.last ?? mp?.price ?? null; } catch {}
+        const gp = await gasPrice();
+        await panicSellAll(a.token, a.curve, holders, gp, concurrency, { estPrice: anchorPrice2, slippageBps });
+        await sleep(Math.max(2000, interval));
+        continue;
+      }
+
       // ۱) معاملات تازه — برای سرمایه، فلوت و قیمت (همه از یک اسکن)
       const trades = await curveTrades(a.curve, fromBlock);
 
@@ -175,16 +203,10 @@ async function main() {
         for (const s of signers) { try { after += await provider.getBalance(s.address); } catch {} }
         const received = Number(fmt(after - before));
         if (pres.fail > 0) {
-          panicAttempts++;
-          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق (تلاش ${panicAttempts}/${maxPanicAttempts}) — چرخه‌ی رصد ادامه دارد و ولت‌های باقی‌مانده دوباره پنیک می‌شوند…`);
-          if (panicAttempts >= maxPanicAttempts) {
-            const left = [];
-            for (const s of signers) { try { if ((await token.balanceOf(s.address)) > 0n) left.push(s.address); } catch {} }
-            console.log(`⛔ خروج پس از ${maxPanicAttempts} تلاش کامل نشد. ولت‌های دارای موجودی:\n${left.join("\n")}\nاقدام دستی: sell.js یا (پس از گرجوئیشن) --ur-data مستقیم برای این ولت‌ها`);
-            process.exitCode = 2;
-            return;
-          }
-          continue; // رصد ادامه دارد — توقفِ monitoring ناقص خروج دیگر
+          // شروع حالت تخلیه: از این نقطه شرط سود دیگر تنظیم‌کننده نیست و ولت‌های دارای توکن تا پایان جنگیده می‌شوند
+          exiting = true;
+          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق — حالت تخلیه فعال شد؛ رصد/تخلیه بدون شرط سود ادامه دارد…`);
+          continue;
         }
         console.log(`💵 بازده کل واقعی پس از خروج (عایدی قبلی + دلتای این خروج): ${(proceedsEth + received).toFixed(4)} ETH${spentEth > 0 ? ` = ${((proceedsEth + received) / spentEth).toFixed(2)}× سرمایه (سود واقعی ${(((proceedsEth + received) / spentEth - 1) * 100).toFixed(0)}٪)` : ""}`);
         if (spentEth > 0 && (proceedsEth + received) / spentEth < neededMult) console.log(`⚠️ پرشدنی واقعی زیر مدل آمد (${((proceedsEth + received) / spentEth).toFixed(2)} < ${neededMult.toFixed(2)}) — تخفیف/فی را محافظه‌کارتر کن`);

@@ -150,6 +150,27 @@ export function nowTag() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
+// ─── منیجر نقشه‌ی تخصیص بچ‌بای (تست‌شدنی — سناریوی overspend ممیزی ۳ دقیقاً همین‌جا قفل شد) ───
+// resume: اگر ژورنال alloc منجمد دارد و کاری انجام‌شده، همان برمی‌گردد؛ نبودِ اجرا یا --fresh ⇒ تخصیص تازه
+export function resolveBatchAllocation({ journal = null, fresh = false, recipients, totalWei, minShareWei, dryRun = false }) {
+  const hasWork = journal && (((journal.results ?? []).length + (journal.failed ?? []).length) > 0);
+  if (journal && !fresh && journal.alloc && hasWork) {
+    const al = journal.alloc;
+    const alRecips = (al.recipients ?? []).map((x) => x.toLowerCase());
+    const now = recipients.map((r) => r.toLowerCase());
+    if (JSON.stringify(alRecips) !== JSON.stringify(now)) return { ok: false, reason: "alloc-recipients-mismatch" };
+    return { ok: true, source: "frozen", amountsWei: al.amountsWei.map((w) => BigInt(w)) };
+  }
+  const amountsWei = splitWeiRandom(BigInt(totalWei), recipients.length, dryRun ? 0n : BigInt(minShareWei));
+  return {
+    ok: true, source: "fresh", amountsWei,
+    journalAlloc: {
+      totalEth: Number(fmt(BigInt(totalWei))), minShareEth: Number(fmt(BigInt(minShareWei))),
+      recipients: recipients.slice(), amountsWei: amountsWei.map((w) => w.toString()),
+    },
+  };
+}
+
 // ─── خواندن/نوشتن اتمیک JSON (ضد کرش نیمه‌کاره) + بکاپ .bak ───
 import fs from "node:fs";
 export function atomicWriteJson(file, obj) {
@@ -160,6 +181,7 @@ export function atomicWriteJson(file, obj) {
 }
 export function readJsonSafe(file, { allowBak = true } = {}) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) {
+    if (typeof e.code === "string" && e.code === "ENOENT") return null; // فایل حذف‌شده = خالی؛ .bak هرگز فایلِ پاک‌شده را «نجات» نمی‌دهد (رفع باگ silence-restore)
     if (allowBak) {
       try {
         const j = JSON.parse(fs.readFileSync(`${file}.bak`, "utf8"));
@@ -167,24 +189,76 @@ export function readJsonSafe(file, { allowBak = true } = {}) {
         return j;
       } catch {}
     }
-    if (typeof e.code === "string" && e.code === "ENOENT") return null;
     throw new Error(`ژورنال خراب است و بکاپ هم در دسترس نیست — بازیابی دستی لازم: ${file}`);
   }
 }
 
 // ─── وضعیت یک تراکنش: بعد از TIMEOUT/قطعی RPC، مسئله‌ی «ماین شده یا نه» روشن می‌شود ───
-// خروجی: "ok" | "reverted" | "pending" (در mempool/لایافته — انتظار بیشتر لازم) | "absent" (اصلاً ثبت نشده — retry امن است)
-export async function classifyTx(txHash, { polls = 3, intervalMs = 5000 } = {}) {
+// خروجی: "ok" | "reverted" | "pending" (در mempool/لایافته) | "absent" (قطعاً ثبت نشده — retry امن) | "unknown" (RPC خطا داد — retry ممنوع!)
+// تفکیک absent/unknown حیاتی است: treat-RPC-error-as-absent ⇒ ارسال تکراری (باگ بحرانی ممیزی ۳)
+export async function classifyTx(txHash, { polls = 3, intervalMs = 5000, rpc = null } = {}) {
+  const p = rpc ?? provider;
+  let rpcFailed = false;
   for (let i = 0; i < polls; i++) {
     try {
-      const rc = await provider.getTransactionReceipt(txHash);
+      const rc = await p.getTransactionReceipt(txHash);
       if (rc) return rc.status === 1 ? "ok" : "reverted";
-      const tx = await provider.getTransaction(txHash);
+      const tx = await p.getTransaction(txHash);
       if (tx) return "pending";
-    } catch {}
+      // این poll «خواندن پیاپ خالص» بود؛ ادامه می‌دهیم
+    } catch { rpcFailed = true; }
     if (i < polls - 1) await sleep(intervalMs);
   }
-  return "absent";
+  return rpcFailed ? "unknown" : "absent";
+}
+
+// ─── run-lock مالکیت‌دار اتمیک (مشترک بین batch_buy و fund) ───
+// ساخت انحصاری با 'wx' (ضد TOCTOU) + توکن مالک: پاک‌کردن فقط وقتی توکن فایل == توکن ما.
+// --force: فقط وقتی اجازه که PID مالک زنده نباشد (مگر --force-live-pid صریح).
+import process from "node:process";
+const lockState = new Map(); // file → token
+export function pidAlive(pid) {
+  try { process.kill(Number(pid), 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+export function acquireRunLock(file, { force = false, forceLivePid = false } = {}) {
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  for (;;) {
+    try {
+      const fd = fs.openSync(file, "wx");
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
+      fs.closeSync(fd);
+      lockState.set(file, token);
+      const rel = () => releaseRunLock(file);
+      process.on("exit", rel);
+      return token;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      const prevRaw = (() => { try { return fs.readFileSync(file, "utf8"); } catch { return "?"; } })();
+      let prev = null; try { prev = JSON.parse(prevRaw); } catch {}
+      if (!force) {
+        const alive = prev?.pid && pidAlive(prev.pid);
+        console.log(`⛔ run-lock فعال است (${file}): ${prevRaw}${alive ? "\nPID مالک «زنده» است!" : ""}\nاگر اجرای قبلی واقعاً مرده، با --force دوباره بیا.`);
+        process.exit(1);
+      }
+      // force: اگر PID مالک هنوز زنده است، شکستن لاک خطرناک است
+      if (prev?.pid && pidAlive(prev.pid) && !forceLivePid) {
+        console.log(`⛔ مالکِ لاک (PID ${prev.pid}) هنوز زنده است — --force مجاز نیست. اگر واقعاً مطمئنی: --force --force-live-pid`);
+        process.exit(1);
+      }
+      console.warn("⚠️ run-lock قبلی با --force نادیده گرفته شد");
+      try { fs.unlinkSync(file); } catch (e2) { if (e2.code !== "ENOENT") throw e2; }
+    }
+  }
+}
+export function releaseRunLock(file) {
+  const token = lockState.get(file);
+  if (!token) return; // مالک نیستیم
+  try {
+    const j = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (j.token !== token) { console.warn("⚠️ لاک متعلق به پردازش دیگری است — دست نخورده ماند"); return; }
+    fs.unlinkSync(file);
+  } catch {}
+  lockState.delete(file);
 }
 
 // حذف امضاکننده‌های تکراری بر اساس آدرس — جلوگیری از شمارش مضاعف دارایی و تصادم nonce

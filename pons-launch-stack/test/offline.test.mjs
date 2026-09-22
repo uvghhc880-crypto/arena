@@ -246,5 +246,88 @@ ok("numOpt int: '50' قبول", numOpt("50", 0, { int: true, name: "pct" }) === 
   ok("legacy با آفست سازگار است", leg.every((w, i) => w.index === 5 + i));
 }
 
+// ═══════════════ ممیزی ۳ — تست ادعاهای جدید ═══════════════
+
+// ─── ۲۰) resolveBatchAllocation — سناریوی دقیق overspend ممیزی ───
+{
+  const { resolveBatchAllocation } = lib;
+  const X = "0x" + "11".repeat(20), Y = "0x" + "22".repeat(20);
+  // ژورنال اجرای اول: [X=909091, Y=90909] (wei واحد ساده)، X انجام‌شده
+  const frozenJournal = {
+    header: { chainId: 4663 }, results: [{ recipient: X, tx: "0xAA" }], failed: [],
+    alloc: { totalEth: 1000000, recipients: [X, Y], amountsWei: ["909091", "90909"] },
+  };
+  // resume بدون این فیکس: تخصیص تصادفی دوباره می‌توانست [90909, 909091] شود ⇒ خرج 1818182 ⊃ 1000000
+  const r = resolveBatchAllocation({ journal: frozenJournal, fresh: false, recipients: [X, Y], totalWei: 1000000n, minShareWei: 0n, dryRun: false });
+  ok("resume از نقشه‌ی منجمد استفاده می‌کند", r.ok && r.source === "frozen");
+  ok("مبلغ Y همان 90909 است (نه دوباره‌تصادفی)", r.amountsWei[1] === 90909n);
+  ok("∑ خرجِ احتمالی = X‌‌انجام‌شده + Y‌همان = ۱,۰۰۰,۰۰۰ دقیق (overspend صفر)", 909091n + r.amountsWei[1] === 1000000n);
+  // recipient ناهماهنگ ⇒ رد
+  const r2 = resolveBatchAllocation({ journal: frozenJournal, fresh: false, recipients: [X, "0x" + "33".repeat(20)], totalWei: 1000000n, minShareWei: 0n });
+  ok("لیست متفاوت ⇒ رد (غیرامن نیست)", !r2.ok);
+  // --fresh ⇒ تخصیص تازه
+  const r3 = resolveBatchAllocation({ journal: frozenJournal, fresh: true, recipients: [X, Y], totalWei: 1000000n, minShareWei: 0n });
+  ok("--fresh تخصیص تازه (صرف‌نظر از ژورنال)", r3.ok && r3.source === "fresh");
+}
+
+// ─── ۲۱) readJsonSafe: ENOENT هرگز .bak برنمی‌گرداند (صمت-بازگردانی حذف‌شده) ───
+{
+  const t2 = `${os.tmpdir()}/json_e_noent_${process.pid}.json`;
+  atomicWriteJson(t2, { v: 1 }); atomicWriteJson(t2, { v: 2 }); // حالا .bak با v:1 هست
+  fs.rmSync(t2, { force: true }); // کاربر ژورنال را دستی پاک کرد
+  const r = readJsonSafe(t2);
+  ok("فایل پاک‌شده ⇒ null (نه .bak قدیمی)", r === null);
+  fs.rmSync(`${t2}.bak`, { force: true });
+}
+
+// ─── ۲۲) classifyTx با RPC استب — تفکیک unknown/absent ───
+{
+  const { classifyTx } = lib;
+  const stubRpc = (behavior) => ({
+    async getTransactionReceipt() { if (behavior === "rpc-error") throw new Error("rpc down"); if (behavior === "ok") return { status: 1 }; if (behavior === "reverted") return { status: 0 }; return null; },
+    async getTransaction() { if (behavior === "rpc-error") throw new Error("rpc down"); if (behavior === "pending") return { hash: "0x1" }; return null; },
+  });
+  ok("RPC خطا ⇒ «unknown» (نه absent)", (await classifyTx("0x1", { polls: 2, intervalMs: 1, rpc: stubRpc("rpc-error") })) === "unknown");
+  ok("بی‌رسید+بی‌tx ⇒ «absent» (خواندن پاک)", (await classifyTx("0x1", { polls: 2, intervalMs: 1, rpc: stubRpc("absent") })) === "absent");
+  ok("pending تشخیص داده می‌شود", (await classifyTx("0x1", { polls: 1, rpc: stubRpc("pending") })) === "pending");
+  ok("ok و reverted", (await classifyTx("0x1", { polls: 1, rpc: stubRpc("ok") })) === "ok" && (await classifyTx("0x1", { polls: 1, rpc: stubRpc("reverted") })) === "reverted");
+}
+
+// ─── ۲۳) run-lock مشترک lib: دو پردازش واقعی رقابت‌کنند ───
+{
+  const { spawn, spawnSync } = await import("node:child_process");
+  const lk = `${os.tmpdir()}/runlock_${process.pid}.json`;
+  // پردازش A: لاک را می‌گیرد و 900ms زنده می‌ماند
+  const scriptA = `import { acquireRunLock } from "${ROOT}/src/lib.js"; acquireRunLock("${lk}"); console.log("GRABBED"); setTimeout(()=>process.exit(0), 900); setInterval(()=>{},500);`;
+  const a = spawn("node", ["--input-type=module", "-e", scriptA]);
+  await new Promise((res) => { a.stdout.on("data", (d) => String(d).includes("GRABBED") && res()); });
+  // پردازش B: باید رد شود (لاک زنده)
+  const b = spawnSync("node", ["--input-type=module", "-e", `import { acquireRunLock } from "${ROOT}/src/lib.js"; acquireRunLock("${lk}"); console.log("B GOT IT");`]);
+  ok("پردازش دوم رد شد (exit≠0 و لاک به دست نگرفت)", b.status !== 0 && !String(b.stdout).includes("B GOT IT"));
+  // پردازش A می‌میرد ⇒ لاک آزاد می‌شود
+  await new Promise((res) => a.on("exit", res));
+  await new Promise((r) => setTimeout(r, 100));
+  const exists = fs.existsSync(lk);
+  ok("بعد از مرگ A لاک آزاد است", !exists);
+  fs.rmSync(lk, { force: true });
+}
+
+// ─── ۲۴) pidAlive ───
+{
+  const { pidAlive } = lib;
+  ok("pidAlive(self)=true", pidAlive(process.pid) === true);
+  ok("pidAlive(99999999)=false", pidAlive(99999999) === false);
+}
+
+// ─── ۲۵) ladder واقعی sell.js (import از خود فایل — نه کپی‌برداری در تست) ───
+{
+  const sellMod = await import("../src/sell.js");
+  const { ladder } = sellMod;
+  ok("ladder farm = ۱۰ پله‌ی ۱۰٪", ladder("farm").length === 10 && ladder("farm").every((x) => x === 10));
+  ok("ladder gradual جمع ۱۰۰ است", ladder("gradual").reduce((a, b) => a + b, 0) === 100);
+  ok("ladder micro/aggressive هم جمع ۱۰۰", ladder("micro").reduce((a, b) => a + b, 0) === 100 && ladder("aggressive").reduce((a, b) => a + b, 0) === 100);
+  ok("UR_COMMAND_NAMES صادر می‌شود", typeof sellMod.UR_COMMAND_NAMES === "object" && sellMod.UR_COMMAND_NAMES[0x10]?.includes("V4"));
+}
+
 console.log(`\n————— نتیجه: ${pass} PASS، ${fail} FAIL —————`);
 process.exit(fail > 0 ? 1 : 0);

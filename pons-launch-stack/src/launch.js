@@ -28,7 +28,13 @@ async function main() {
   const a = parseArgs();
   if (a.dry === "factory") {
     // --dry factory : حالت تست‌سر — نام فلگ تاریخی است؛ این مسیر تراکنش «واقعی» می‌فرستد!
-    console.warn("🧨 توجه: --dry factory با وجود نامش، یک لانچ واقعی روی مین‌نت ارسال می‌کند (حالت تست‌سر فارم).");
+    // گیت ایمنی: نداشتن --i-know-this-sends ⇒ ابطال تا ارسال واقعی کاملاً آگاهانه باشد
+    if (!truthy(a["i-know-this-sends"])) {
+      console.log(`🧨 «--dry factory» با وجود نامش، تراکنش واقعی روی مین‌نت ارسال می‌کند و فی می‌سوزاند.
+اگر فقط شبیه‌سازی می‌خواهی، این فلگ را بده:  --i-know-this-sends`);
+      process.exit(1);
+    }
+    console.warn("🧨 ارسال واقعی --dry factory با گیت تأیید (--i-know-this-sends)");
     return dryFactoryLaunch(a);
   }
 
@@ -150,9 +156,25 @@ async function main() {
     { value }
   );
   console.log("tx:", tx.hash);
-  const rc = await tx.wait();
+
+  // ← رکورد FIRST، بلافاصله بعد از broadcast و قبل از wait: اگر الان RPC بترکه یا فرایند کرش کند،
+  // «تراکنش داریم ولی آدرس توکن نه» — رسید بعداً با `src/probe.js --sig ...` یا Blockscout تکمیل می‌شود.
+  const file = path.join(LAUNCHES_DIR, `launch_${nowTag()}_${safeName(symbol)}.json`);
+  const record = {
+    name, symbol, txHash: tx.hash,
+    token: null, curve: null, state: "broadcast",
+    creator: master.address, feeRecipient,
+    quoteIn: quoteEth, exemptions: snipeTaxExemptions, workerStart: exemptStart,
+    chainId: CHAIN.id, launchConfigId, launchFeeWei: launchFee.toString(),
+    receiptStatus: null, blockNumber: null,
+    createdAt: new Date().toISOString(),
+  };
+  atomicWriteJson(file, record);
+  console.log("📄 رکورد اولیه (state=broadcast) نوشته شد:", file);
+
+  const rc = await tx.wait(1, 180000);
   if (rc.status !== 1) {
-    console.log("⛔ تراکنش لانچ ریورت شد (status=0) — رکورد با token=null ذخیره می‌شود");
+    console.log("⛔ تراکنش لانچ ریورت شد (status=0) — رکورد با token=null می‌ماند");
   }
 
   // استخراج آدرس توکن/کرو فقط از ایونت Launched — بدون حدس از logs[0] (حدس می‌تواند آدرس اشتباه ذخیره کند!)
@@ -170,19 +192,16 @@ async function main() {
   }
   if (!tokenAddr) console.warn("⚠️ ایونت Launched پیدا نشد — token/curve در رکورد null است؛ از Blockscout دستی بخوان و در رکورد بنویس");
 
-  const record = {
-    name, symbol, txHash: tx.hash,
-    token: tokenAddr ?? null, curve: curveAddr ?? null,
-    creator: master.address, feeRecipient,
-    quoteIn: quoteEth, exemptions: snipeTaxExemptions, workerStart: exemptStart,
-    chainId: CHAIN.id, launchConfigId, launchFeeWei: launchFee.toString(),
-    receiptStatus: rc.status, blockNumber: rc.blockNumber,
-    createdAt: new Date().toISOString(),
-  };
-  const file = path.join(LAUNCHES_DIR, `launch_${nowTag()}_${safeName(symbol)}.json`);
-  atomicWriteJson(file, record); // نوشتن اتمیک — کرش موازی فایل را نیمه‌کاره نگذارد
+  // به‌روزرسانی رکورد نهایی روی همان فایل
+  record.token = tokenAddr ?? null;
+  record.curve = curveAddr ?? null;
+  record.state = rc.status === 1 ? "confirmed" : "reverted";
+  record.receiptStatus = rc.status;
+  record.blockNumber = rc.blockNumber;
+  record.confirmedAt = new Date().toISOString();
+  atomicWriteJson(file, record);
   console.log("🎉 پایان لانچ:", tokenAddr ? `token=${tokenAddr} curve=${curveAddr ?? "?"} tokensOut=${tokensOut ? tokensOut.toString() : "?"}` : "آدرس توکن null (رکورد را دستی تکمیل کن)");
-  console.log("📄 رکورد:", file);
+  console.log("📄 رکورد (نهایی):", file);
 }
 
 async function dryFactoryLaunch(a) {

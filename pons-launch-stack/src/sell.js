@@ -24,11 +24,14 @@ function ladder(mode) {
 }
 
 // نقشه‌ی فرمان‌های استاندارد Universal Router — فقط برای «هشدار»؛ دیتای واقعی متعلق به deployment توست
-const UR_COMMAND_NAMES = {
+export const UR_COMMAND_NAMES = {
   0x00: "V3_SWAP_EXACT_IN", 0x01: "V3_SWAP_EXACT_OUT",
   0x02: "PERMIT2_TRANSFER_FROM", 0x03: "PERMIT2_PERMIT",
   0x10: "V4_SWAP (پلنر V4 — زیرفرمان‌ها داخل input)",
 };
+
+// ladder به‌صورت صادر — تست‌ها همان پیاده‌سازی واقعی را صدا می‌زنند (نه کپی منطق)
+export { ladder };
 
 async function main() {
   const a = parseArgs();
@@ -141,8 +144,8 @@ async function main() {
         await provider.call({ to: curve, data, from: s.wallet.address }); // شبیه‌سازی قبل از ارسال
         tx = await cr.sell(stepAmt, minOut, s.address, { gasPrice: gp });
       } else if (urUse) {
-        // آماده‌سازی Permit2 — اگر --permit2: approve توکن→Permit2 و Permit2→روتر قبل از execute
-        if (truthy(a.permit2)) {
+        // آماده‌سازی Permit2 — پیش‌فرض روشن (مسیر استاندارد UR: توکن→Permit2→روتر)؛ --no-permit2 = approve مستقیم روتر
+        if (!truthy(a["no-permit2"])) {
           await (await tw.approve(ADDR.PERMIT2, ethers.MaxUint256, { gasPrice: gp })).wait(1, 120000);
           const p2 = new Contract(ADDR.PERMIT2, PERMIT2_ABI, s.wallet);
           const exp = Math.floor(Date.now() / 1000) + 1800;

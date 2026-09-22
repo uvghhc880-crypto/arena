@@ -329,5 +329,85 @@ ok("numOpt int: '50' قبول", numOpt("50", 0, { int: true, name: "pct" }) === 
   ok("UR_COMMAND_NAMES صادر می‌شود", typeof sellMod.UR_COMMAND_NAMES === "object" && sellMod.UR_COMMAND_NAMES[0x10]?.includes("V4"));
 }
 
+// ═══ بلوک ممیزی ۴ ═══
+
+// ─── ۲۶) eth()/weiOf() بدون گردکردن Number (باگ «0.0000009 ⇒ 1000» و «⇒0» بود) ───
+{
+  const { eth, weiOf } = lib;
+  ok("eth(0.0000009) = 900000000000 wei", eth(0.0000009) === 900000000000n);
+  ok("eth(\"0.0000000000000009\") = 900 wei (هجده رقم اعشار)", eth("0.0000000000000009") === 900n);
+  ok("weiOf همان مسیر string-first است", weiOf("0.05") === 50000000000000000n);
+  ok("eth(3) = 3 ETH", eth(3) === 3000000000000000000n);
+  let r1 = false, r2 = false, r3 = false;
+  try { eth("0.1234567890123456789"); } catch { r1 = true; } // ۱۹ رقم اعشار ⇒ ابطال
+  try { eth("abc"); } catch { r2 = true; }
+  try { eth(-1); } catch { r3 = true; }
+  ok("۱۹ رقم اعشار/abc/منفی همه ابطال می‌شوند", r1 && r2 && r3);
+}
+
+// ─── ۲۷) resolveBatchAllocation: alloc-missing-on-resume fail-closed + فرمت ژورنال fund ───
+{
+  const { resolveBatchAllocation } = lib;
+  const recips = ["0x00000000000000000000000000000000000000a1", "0x00000000000000000000000000000000000000a2"];
+  // ژورنالِ batch با کارِ انجام‌شده اما بدون alloc ⇒ محکم‌بستن
+  const oldB = { header: {}, results: [{ tx: "0x1", valueWei: "1000" }], failed: [] };
+  const r1 = resolveBatchAllocation({ journal: oldB, fresh: false, recipients: recips, totalWei: 2000n, minShareWei: 0n });
+  ok("batch: ژورنال قدیمی بدون alloc ⇒ fail-closed", !r1.ok && r1.reason === "alloc-missing-on-resume");
+  // ژورنالِ fund (entries-map) بدون alloc ⇒ همان داوری
+  const oldF = { meta: {}, entries: { "0xA": { valueWei: "1000", state: "ok" } } };
+  const r2 = resolveBatchAllocation({ journal: oldF, fresh: false, recipients: recips, totalWei: 2000n, minShareWei: 0n });
+  ok("fund: ژورنال entries بدون alloc ⇒ fail-closed", !r2.ok && r2.reason === "alloc-missing-on-resume");
+  // fund با alloc منجمد ⇒ همان سهم‌ها برمی‌گردند
+  const frozenF = { meta: {}, entries: { "0xA": { valueWei: "1000", state: "ok" } }, alloc: { recipients: recips, amountsWei: ["1500", "500"], totalEth: 0.0000018 } };
+  const r3 = resolveBatchAllocation({ journal: frozenF, fresh: false, recipients: recips, totalWei: 2000n, minShareWei: 0n });
+  ok("fund: alloc منجمد دقیقاً همان‌قدر برمی‌گردد", r3.ok && r3.source === "frozen" && r3.amountsWei[0] === 1500n && r3.amountsWei[1] === 500n);
+  // ژورنال خالی (بدون کار) ⇒ تخصیص تازه مجاز
+  const r4 = resolveBatchAllocation({ journal: { meta: {}, entries: {} }, fresh: false, recipients: recips, totalWei: 2000n, minShareWei: 0n });
+  ok("ژورنال بدون کار قبلی ⇒ تخصیص تازه OK", r4.ok && r4.source === "fresh" && r4.amountsWei.length === 2 && r4.amountsWei.reduce((a, b) => a + b, 0n) === 2000n);
+}
+
+// ─── ۲۸) run-lock سراسری: دو «نسخه‌ی پروژه» (لاک محلی متفاوت، globalKey یکسان) — دومی رد شود ───
+{
+  const { spawn, spawnSync } = await import("node:child_process");
+  const gk = `pons-testlock-${process.pid}`;
+  const lkA = `${os.tmpdir()}/projA/runlock_${process.pid}.json`;
+  const lkB = `${os.tmpdir()}/projB/runlock_${process.pid}.json`; // مسیر محلیِ متفاوت — کپی دوم پروژه
+  fs.mkdirSync(`${os.tmpdir()}/projA`, { recursive: true });
+  fs.mkdirSync(`${os.tmpdir()}/projB`, { recursive: true });
+  const scriptA = `import { acquireRunLock } from "${ROOT}/src/lib.js"; acquireRunLock("${lkA}", { globalKey: "${gk}" }); console.log("GRABBED"); setTimeout(()=>process.exit(0), 900); setInterval(()=>{},500);`;
+  const a = spawn("node", ["--input-type=module", "-e", scriptA]);
+  await new Promise((res) => { a.stdout.on("data", (d) => String(d).includes("GRABBED") && res()); });
+  // پردازش B با مسیر محلیِ متفاوت و globalKey یکسان ⇒ باید رد شود
+  const b = spawnSync("node", ["--input-type=module", "-e", `import { acquireRunLock } from "${ROOT}/src/lib.js"; acquireRunLock("${lkB}", { globalKey: "${gk}" }); console.log("B GOT IT");`]);
+  ok("قفل سراسری: نسخه‌ی دوم پروژه (globalKey یکسان) رد شد", b.status !== 0 && !String(b.stdout).includes("B GOT IT"));
+  await new Promise((res) => a.on("exit", res));
+  await new Promise((r) => setTimeout(r, 100));
+  // بعد از مرگ A، لاک محلی و سراسری هر دو آزادند
+  const gfileGlob = `${os.homedir()}/.pons-launch-stack-locks/${gk}-${""}.lock`;
+  void gfileGlob;
+  const gFile = `${os.homedir()}/.pons-launch-stack-locks/${gk}.lock`;
+  ok("بعد از مرگ A هم لاک محلی هم لاک سراسری آزاد است", !fs.existsSync(lkA) && !fs.existsSync(gFile));
+  fs.rmSync(lkA, { force: true }); fs.rmSync(lkB, { force: true }); fs.rmSync(gFile, { force: true });
+}
+
+// ─── ۲۹) decodeUrBlob: دیکود واقعی payloadهای V3/V4 (همان کد production — نه کپی) ───
+{
+  const { AbiCoder, ethers } = await import("ethers");
+  const sellMod = await import("../src/sell.js");
+  const coder = AbiCoder.defaultAbiCoder();
+  const recip = "0x0000000000000000000000000000000000000bEE".toLowerCase();
+  const v3 = coder.encode(["bytes", "address", "uint256", "uint256"], ["0xaabbccddeeff", recip, 12345n, 999n]);
+  const d1 = sellMod.decodeUrBlob(0x00, v3);
+  ok("V3_SWAP_EXACT_IN دیکود درست", d1.name === "V3_SWAP_EXACT_IN" && d1.recipient.toLowerCase() === recip && d1.amountIn === "12345" && d1.amountOutMin === "999");
+  const v4 = coder.encode(["bytes", "bytes[]"], ["0x001122", ["0xaa", "0xbb", "0xcc"]]);
+  const d2 = sellMod.decodeUrBlob(0x10, v4);
+  ok("V4_SWAP دیکود درست (اکشن‌ها/پارام‌ها)", d2.actionsBytes === 3 && d2.paramCount === 3);
+  ok("فرمان ناشناخته ⇒ null (بدون decode-check سخت‌گیرانه)", sellMod.decodeUrBlob(0x08, "0x1234") === null);
+  let threw = false;
+  try { sellMod.decodeUrBlob(0x00, "0x1234"); } catch { threw = true; } // بلوب خراب با فرمان شناخته ⇒ throw (ابطال در main)
+  ok("بلوب نامعتبر با فرمان شناخته ⇒ خطا", threw);
+  void ethers;
+}
+
 console.log(`\n————— نتیجه: ${pass} PASS، ${fail} FAIL —————`);
 process.exit(fail > 0 ? 1 : 0);

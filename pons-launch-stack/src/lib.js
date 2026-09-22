@@ -64,12 +64,26 @@ export function normalizeBytes32(s) {
   return zeroPadValue("0x" + h, 32);
 }
 
-// ⚠️ eth() برای «ورود عدد اعشاری کاربر» است: ۶ رقم کفِ دقت CLI ماست.
-//    برای مبالغ محاسبه‌شده‌ی داخلی همیشه از BigInt wei (splitWeiRandom/مقادیر ژورنال) استفاده کن.
-export const eth = (x) => parseEther(Number(x).toFixed(6));
+// مبالغ مالی: string-first — هیچ گردکردنی از طریق Number نداریم (باگ «0.0000009 ⇒ 0.000001 ETH» و «⇒0!»)
+// ورودی string: خودش (تا ۱۸ رقم اعشار)؛ ورودی number: تبدیلِ دقیقِ رشته‌ی خودش + هشدار دقت.
+const DEC18 = /^\d+(\.\d{1,18})?$/;
+export const eth = (x) => {
+  if (typeof x === "string") {
+    const s = x.trim();
+    if (!DEC18.test(s)) throw new Error(`مقدار ETH نامعتبر (بیش از ۱۸ رقم اعشار یا فرمت بد): "${x}"`);
+    return parseEther(s);
+  }
+  const n = Number(x);
+  if (!Number.isFinite(n)) throw new Error(`مقدار ETH نامعتبر: ${x}`);
+  if (n < 0) throw new Error(`مقدار ETH منفی مجاز نیست: ${x}`);
+  let s = String(n); // دقیق‌ترین نمایش IEEE-754 — ممکن است فرم نماد علمی بگیرد ("9e-7")
+  if (/[eE]/.test(s)) s = n.toFixed(18).replace(/0+$/, "").replace(/\.$/, ""); // گسترش فرم علمی به اعشاری ساده
+  if (!DEC18.test(s)) throw new Error(`مقدار ETH نامعتبر (بیش از ۱۸ رقم اعشار یا فرمت بد): "${x}"`);
+  return parseEther(s);
+};
+// weiOf فقط اشاره به همان eth است — مسیر واحدهای پول = همیشه string-first
+export const weiOf = eth;
 export const fmt = formatEther;
-// wei دقیق از عدد اعشاری (تا ۱۲ رقم اعشار — برای محاسبات داخلی، بدون ازدست‌دادن در مبالغ ریز)
-export const weiOf = (x) => parseEther(Number(x).toFixed(12));
 
 export async function gasPrice() {
   const fd = await provider.getFeeData();
@@ -152,9 +166,24 @@ export function nowTag() {
 
 // ─── منیجر نقشه‌ی تخصیص بچ‌بای (تست‌شدنی — سناریوی overspend ممیزی ۳ دقیقاً همین‌جا قفل شد) ───
 // resume: اگر ژورنال alloc منجمد دارد و کاری انجام‌شده، همان برمی‌گردد؛ نبودِ اجرا یا --fresh ⇒ تخصیص تازه
+// ممیزی ۴ — preflight «این آدرس واقعاً قرارداد است؟» (پول رفتن به آدرس EOA/خالی از جدی‌ترین ریسک‌هاست)
+// قبل از هر عملیات حساس: آدرس‌مان code دارد؟ EOA ⇒ ابطال فوری.
+export async function assertContract(addr, label = "contract") {
+  const code = await provider.getCode(addr);
+  if (!code || code === "0x") {
+    throw new Error(`⛔ ${label} (${addr}) روی چین ${CHAIN.id} کد ندارد (EOA/آدرس اشتباه) — ادامه ممنوع. آدرس/چین را دوباره چک کن.`);
+  }
+  return code;
+}
+
 export function resolveBatchAllocation({ journal = null, fresh = false, recipients, totalWei, minShareWei, dryRun = false }) {
-  const hasWork = journal && (((journal.results ?? []).length + (journal.failed ?? []).length) > 0);
-  if (journal && !fresh && journal.alloc && hasWork) {
+  const hasWork = journal && (
+    (((journal.results ?? []).length + (journal.failed ?? []).length) > 0) ||
+    (journal.entries && Object.keys(journal.entries).length > 0) // فرمت ژورنال fund
+  );
+  if (journal && !fresh && hasWork) {
+    // ممیزی ۴: ژورنالِ دارای کارِ انجام‌شده بدون نقشه‌ی منجمد ⇒ محکم‌بستن — هرگز بی‌صدا تخصیص تازه نساز
+    if (!journal.alloc) return { ok: false, reason: "alloc-missing-on-resume" };
     const al = journal.alloc;
     const alRecips = (al.recipients ?? []).map((x) => x.toLowerCase());
     const now = recipients.map((r) => r.toLowerCase());
@@ -216,21 +245,28 @@ export async function classifyTx(txHash, { polls = 3, intervalMs = 5000, rpc = n
 // ساخت انحصاری با 'wx' (ضد TOCTOU) + توکن مالک: پاک‌کردن فقط وقتی توکن فایل == توکن ما.
 // --force: فقط وقتی اجازه که PID مالک زنده نباشد (مگر --force-live-pid صریح).
 import process from "node:process";
+import os from "node:os";
+import path from "node:path";
 const lockState = new Map(); // file → token
+const lockGroups = new Map(); // file اصلی → [fileها در گروه] (محلی + سراسری)
+// لاک سراسری per-chain/per-wallet: جلوی دو نسخه‌ی متفاوت پروژه (دو پوشه/دستگاهِ NFS-مشترک) را می‌گیرد
+function globalLockPath(globalKey) {
+  const key = String(globalKey).toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const dir = path.join(os.homedir(), ".pons-launch-stack-locks");
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${key}.lock`);
+}
 export function pidAlive(pid) {
   try { process.kill(Number(pid), 0); return true; } catch (e) { return e.code === "EPERM"; }
 }
-export function acquireRunLock(file, { force = false, forceLivePid = false } = {}) {
-  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+function acquireOne(file, { token, force = false, forceLivePid = false }) {
   for (;;) {
     try {
       const fd = fs.openSync(file, "wx");
       fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
       fs.closeSync(fd);
       lockState.set(file, token);
-      const rel = () => releaseRunLock(file);
-      process.on("exit", rel);
-      return token;
+      return;
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
       const prevRaw = (() => { try { return fs.readFileSync(file, "utf8"); } catch { return "?"; } })();
@@ -240,19 +276,41 @@ export function acquireRunLock(file, { force = false, forceLivePid = false } = {
         console.log(`⛔ run-lock فعال است (${file}): ${prevRaw}${alive ? "\nPID مالک «زنده» است!" : ""}\nاگر اجرای قبلی واقعاً مرده، با --force دوباره بیا.`);
         process.exit(1);
       }
-      // force: اگر PID مالک هنوز زنده است، شکستن لاک خطرناک است
       if (prev?.pid && pidAlive(prev.pid) && !forceLivePid) {
         console.log(`⛔ مالکِ لاک (PID ${prev.pid}) هنوز زنده است — --force مجاز نیست. اگر واقعاً مطمئنی: --force --force-live-pid`);
         process.exit(1);
       }
-      console.warn("⚠️ run-lock قبلی با --force نادیده گرفته شد");
+      console.warn(`⚠️ run-lock قبلی با --force نادیده گرفته شد (${file})`);
       try { fs.unlinkSync(file); } catch (e2) { if (e2.code !== "ENOENT") throw e2; }
     }
   }
 }
+// globalKey (اختیاری): مثل "pons-batch-2026-0xabc..." — علاوه بر لاک محلی پوشه، لاک جهانی هم می‌گیرد
+export function acquireRunLock(file, { force = false, forceLivePid = false, globalKey = null } = {}) {
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const files = [file, ...(globalKey ? [globalLockPath(globalKey)] : [])];
+  for (let i = 0; i < files.length; i++) {
+    try { acquireOne(files[i], { token, force, forceLivePid }); }
+    catch (e) {
+      // رول‌بک: لاک‌های تازه گرفته‌شده در همین فراخوان آزاد شوند
+      for (let j = 0; j < i; j++) { lockState.delete(files[j]); try { fs.unlinkSync(files[j]); } catch {} }
+      throw e;
+    }
+  }
+  lockGroups.set(file, files);
+  process.on("exit", () => releaseRunLock(file));
+  return token;
+}
 export function releaseRunLock(file) {
-  const token = lockState.get(file);
-  if (!token) return; // مالک نیستیم
+  const group = lockGroups.get(file) ?? [file];
+  for (const f of group) {
+    const token = lockState.get(f);
+    if (!token) { if (f === file) return; continue; }
+    releaseOne(f, token);
+    lockGroups.delete(f);
+  }
+}
+function releaseOne(file, token) {
   try {
     const j = JSON.parse(fs.readFileSync(file, "utf8"));
     if (j.token !== token) { console.warn("⚠️ لاک متعلق به پردازش دیگری است — دست نخورده ماند"); return; }

@@ -30,8 +30,9 @@ async function main() {
     // --dry factory : حالت تست‌سر — نام فلگ تاریخی است؛ این مسیر تراکنش «واقعی» می‌فرستد!
     // گیت ایمنی: نداشتن --i-know-this-sends ⇒ ابطال تا ارسال واقعی کاملاً آگاهانه باشد
     if (!truthy(a["i-know-this-sends"])) {
-      console.log(`🧨 «--dry factory» با وجود نامش، تراکنش واقعی روی مین‌نت ارسال می‌کند و فی می‌سوزاند.
-اگر فقط شبیه‌سازی می‌خواهی، این فلگ را بده:  --i-know-this-sends`);
+      console.log(`🧨 «--dry factory» با وجود نامش، تراکنش واقعی روی مین‌نت ارسال می‌کند (فی لانچ واقعاً می‌سوزد).
+اگر فقط «شبیه‌سازی بدون پول» می‌خواهی: فلگی لازم نیست — قبل از هر ارسال، provider.call خودش اجرا و نتیجه چاپ می‌شود (ریورت = اتفاقی نمی‌افتد).
+ولی برای گذر از همین نقطه به «ارسال واقعی» این مسیر، صریحاً بگو: --i-know-this-sends`);
       process.exit(1);
     }
     console.warn("🧨 ارسال واقعی --dry factory با گیت تأیید (--i-know-this-sends)");
@@ -135,6 +136,10 @@ async function main() {
   console.log(`   feeRecipient (claimer): ${feeRecipient}`);
   if (exemptN > 0) console.log(`   ولت‌های معاف (${exemptN} ولت، از ایندکس ${exemptStart}): ${snipeTaxExemptions.join(", ")}`);
 
+  // preflight: LAB واقعاً قرارداد است (برخورد آدرس اشتباه با value = سوختن ETH)
+  const labCode = await provider.getCode(ADDR.LAUNCH_AND_BUY);
+  if (!labCode || labCode === "0x") { console.log(`⛔ LaunchAndBuy (${ADDR.LAUNCH_AND_BUY}) کدی ندارد — آدرس/چین را چک کن`); process.exit(1); }
+
   // شبیه‌سازی کامل قبل از ارسال — اگر ریورت کند، ETH از دست نمی‌رود
   const callData = lab.interface.encodeFunctionData("launchAndBuy", [params, launchConfigId, pairToken, eth(quoteEth), minOut, master.address, snipeTaxExemptions]);
   try {
@@ -144,6 +149,15 @@ async function main() {
     console.log("⛔ شبیه‌سازی لانچ ریورت شد — هیچ تراکنشی ارسال نشد:", (e.shortMessage ?? e.message).slice(0, 160));
     process.exit(1);
   }
+
+  // گیت LIVE صریح (ممیزی ۴): شبیه‌سازی OK بودن هرگز به معنی «تأیید ارسال» نیست
+  if (!truthy(a["i-am-live"]) && !truthy(env("I_AM_LIVE", ""))) {
+    console.log(`🛑 گیت LIVE: ارسال واقعی لانچ انجام نشد.
+   شبیه‌سازی بالا موفق بود ولی برای «ارسال واقعی روی مین‌نت با value ${fmt(value)} ETH» تأیید صریح لازم است.
+   برای ادامه: --i-am-live را به همین دستور اضافه کن (یا I_AM_LIVE=1 در .env).`);
+    process.exit(1);
+  }
+  console.warn("🧨 گیت LIVE با --i-am-live تأیید شد — ارسال واقعی لانچ:");
 
   const tx = await lab.launchAndBuy(
     params,
@@ -172,7 +186,24 @@ async function main() {
   atomicWriteJson(file, record);
   console.log("📄 رکورد اولیه (state=broadcast) نوشته شد:", file);
 
-  const rc = await tx.wait(1, 180000);
+  let rc = null;
+  try {
+    rc = await tx.wait(1, 180000);
+  } catch (waitErr) {
+    // ممیزی ۴: wait خطا داد (TIMEOUT/قطع RPC) — رکورد نباید سکوت‌آمیز در «broadcast» بماند
+    let st = "unknown";
+    try {
+      const { classifyTx } = await import("./lib.js");
+      st = await classifyTx(tx.hash, { polls: 3, intervalMs: 5000 });
+    } catch {}
+    record.state = st === "reverted" ? "reverted" : "broadcast";
+    record.classifyState = st;
+    record.waitError = (waitErr.shortMessage ?? waitErr.message).slice(0, 120);
+    record.classifiedAt = new Date().toISOString();
+    atomicWriteJson(file, record);
+    console.log(`⚠️ انتظار برای رسید لانچ ناموفق بود. وضعیت واقعی آنچین = «${st}»\n   هش: ${tx.hash}\n   رکورد در «${record.state}» (classifyState=${st}) ذخیره شد — ${file}\n   تعیین‌تکلیف دستی: Blockscout/probe؛ اگر «ok» بود آدرس‌های token/curve را در رکورد بنویس.`);
+    process.exit(2);
+  }
   if (rc.status !== 1) {
     console.log("⛔ تراکنش لانچ ریورت شد (status=0) — رکورد با token=null می‌ماند");
   }
@@ -231,8 +262,40 @@ async function dryFactoryLaunch(a) {
   }
   const tx = await factory.launchToken(params, ethers.ZeroAddress, master.address, { value: fee });
   console.log("tx:", tx.hash);
-  const rc = await tx.wait();
-  console.log("status:", rc.status === 1 ? "✅" : "❌", "logs:", rc.logs.length);
+
+  // ممیزی ۴: مسیر dry-factory هم ژورنال می‌سازد (قبلاً هیچ ردی نمی‌گذاشت — رسید/فی‌سوزانده‌شده غیرقابل‌ممیزی بود)
+  const file = path.join(LAUNCHES_DIR, `dry_factory_${nowTag()}_${safeName(symbol)}.json`);
+  const record = {
+    kind: "dry-factory", name, symbol, txHash: tx.hash, state: "broadcast",
+    creator: master.address, feeRecipient: params.creatorFeeRecipient,
+    feeWei: fee.toString(), chainId: CHAIN.id,
+    receiptStatus: null, blockNumber: null, createdAt: new Date().toISOString(),
+  };
+  atomicWriteJson(file, record);
+  console.log("📄 رکورد اولیه (state=broadcast):", file);
+
+  let rc = null;
+  try {
+    rc = await tx.wait(1, 180000);
+  } catch (waitErr) {
+    let st = "unknown";
+    try {
+      const { classifyTx } = await import("./lib.js");
+      st = await classifyTx(tx.hash, { polls: 3, intervalMs: 5000 });
+    } catch {}
+    record.state = st === "reverted" ? "reverted" : "broadcast";
+    record.classifyState = st;
+    record.waitError = (waitErr.shortMessage ?? waitErr.message).slice(0, 120);
+    atomicWriteJson(file, record);
+    console.log(`⚠️ انتظار برای رسید dry-factory ناموفق بود. وضعیت واقعی آنچین = «${st}» — هش: ${tx.hash}\n  رکورد: ${file} — تعیین‌تکلیف دستی با Blockscout/probe`);
+    process.exit(2);
+  }
+  record.state = rc.status === 1 ? "confirmed" : "reverted";
+  record.receiptStatus = rc.status;
+  record.blockNumber = rc.blockNumber;
+  record.confirmedAt = new Date().toISOString();
+  atomicWriteJson(file, record);
+  console.log("status:", rc.status === 1 ? "✅" : "❌", "logs:", rc.logs.length, "| رکورد:", file);
 }
 
 main().catch((e) => { console.error("❌", e.reason ?? e.shortMessage ?? e.message); process.exit(1); });

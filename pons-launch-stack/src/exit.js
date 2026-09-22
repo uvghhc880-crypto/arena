@@ -10,9 +10,9 @@
 //   node src/exit.js --curve 0xC --token 0xT --launch-tx 0x<هش لانچ>
 //   node src/exit.js --curve 0xC --token 0xT --launch-tx 0x... --min-profit-pct 125 --fee-bps 300
 import { Contract, Wallet } from "ethers";
-import { env, parseArgs } from "./config.js";
+import { WALLETS_OUT, CHAIN, env, parseArgs } from "./config.js";
 import { ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep, uniqueSigners, legacyHd } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep, uniqueSigners, legacyHd, atomicWriteJson, readJsonSafe, assertContract } from "./lib.js";
 import { curveTrades, panicSellAll, median, marketPrice } from "./market.js";
 
 // ─── فرمول سود (اصلاح‌شده‌ی ممیزی ۲): بازده کل = (عایدی فروش‌های قبلی + ارزش خالص فعلی) نسبت به کل خرید ───
@@ -25,10 +25,20 @@ export function profitTotalPct(spentEth, proceedsEth, realizedNetEth) {
 
 async function resolveFromBlock(a) {
   if (a["launch-tx"]) {
+    let rc = null;
     try {
-      const rc = await provider.getTransactionReceipt(a["launch-tx"]);
-      if (rc) return rc.blockNumber;
-    } catch {}
+      rc = await provider.getTransactionReceipt(a["launch-tx"]);
+    } catch (e) {
+      // ممیزی ۴: خطای RPC ⇒ fail-closed؛ «حدس latest-500» سکوت‌آمیز بود
+      console.log(`⛔ خطای RPC هنگام خواندن رسید --launch-tx: ${(e.shortMessage ?? e.message).slice(0, 80)}\n   به‌جای حدس‌زدن بلاک شروع، متوقف شدم — RPC را چک کن یا --from-block صریح بده.`);
+      process.exit(1);
+    }
+    if (rc) return rc.blockNumber;
+    if (!a["from-block"]) {
+      console.warn(`⚠️ --launch-tx داده شده ولی رسیدی در زنجیره نیست (هنوز ماین نشده یا هش اشتباه) و --from-block هم نداری؛\n   اسکن سرمایه فقط از ۵۰۰ بلاک اخیر — سرمایه‌ی قدیمی‌تر شمرده نمی‌شود! برای اطمینان --from-block صریح بده.`);
+      const latest = await provider.getBlockNumber();
+      return Math.max(0, latest - 500);
+    }
   }
   if (a["from-block"]) return Number(a["from-block"]);
   const latest = await provider.getBlockNumber();
@@ -66,10 +76,20 @@ async function main() {
   const feeBps = Number(a["fee-bps"] ?? 300);
   const k = Number(a["price-trades"] ?? 5);
   const interval = Number(a["interval-ms"] ?? 1200);
-  const concurrency = Math.max(1, Number(a["concurrency"] ?? 6));
+  const concurrency = Math.min(20, Math.max(1, Number(a["concurrency"] ?? 6)));
   const maxMin = Number(a["max-minutes"] ?? 0);
   const maxPanicAttempts = Math.max(1, Number(a["panic-max-attempts"] ?? 8));
-  let panicAttempts = 0;
+
+  // اعتبارسنجی فلگ‌های عددی (ممیزی ۴): مقدارِ بد یعنی تصمیمِ پولیِ بد
+  const badNum = (v, min, max) => !Number.isFinite(v) || v < min || v > max;
+  const die = (msg) => { console.log("⛔", msg); process.exit(1); };
+  if (badNum(minProfitPct, 0, 1_000_000)) die("--min-profit-pct/--target-mult خارج از بازه‌ی معقول (۰ تا ۱٬۰۰۰٬۰۰۰٪)");
+  if (!["linear", "fixed"].includes(impactModel)) die("--impact-model باید linear یا fixed باشد");
+  if (badNum(impactFixed, 0, 0.99)) die("--impact-discount باید بین ۰ و ۰٫۹۹ باشد");
+  if (badNum(feeBps, 0, 5000)) die("--fee-bps باید بین ۰ و ۵۰۰۰ باشد");
+  if (badNum(k, 1, 50)) die("--price-trades باید بین ۱ و ۵۰ باشد");
+  if (badNum(interval, 200, 600_000)) die("--interval-ms باید بین ۲۰۰ و ۶۰۰٬۰۰۰ باشد");
+  if (badNum(maxMin, 0, 10_000)) die("--max-minutes باید بین ۰ و ۱۰٬۰۰۰ باشد");
 
   // امضاکننده‌ها (کریتور + کارگرها + payer) — مبنای سرمایه/دارایی/خروج — یونیک می‌شوند (تصادم nonce!)
   const signerSet = new Set();
@@ -93,6 +113,9 @@ async function main() {
 
   const fromBlock = await resolveFromBlock(a);
   const token = new Contract(a.token, ERC20_ABI, provider);
+  // preflight: کرو و توکن واقعاً قراردادند؟ (ممیزی ۴)
+  await assertContract(a.curve, "باندینگ-کرو");
+  await assertContract(a.token, "توکن");
   const feeFactor = 1 - feeBps / 10000;
   const neededMult = 1 + minProfitPct / 100;
   let exitAnomalyWarned = false;
@@ -100,25 +123,58 @@ async function main() {
   console.log("   (مبنای سرمایه = جمع خریدهای خودی منهای فروش‌های خودی — هر چرخه از رویدادهای تازه)");
 
   const t0 = Date.now();
-  let exiting = false; // ماشین‌حالت: وقتی خروج شروع شود، تا تعیین‌تکلیف همه‌ی ولت‌ها ادامه دارد — مستقل از شرط سود
+
+  // ─── ژورنال تخلیه‌ی پایدار (ممیزی ۴): کرش/ری‌استارت در میانه‌ی تخلیه = ادامه‌ی خودکار از حالت تخلیه، نه بازگشت به رصد سود ───
+  const DRAIN_FILE = `${WALLETS_OUT}/exit-drain-${a.curve.toLowerCase()}-${a.token.toLowerCase()}.json`;
+  const drainPrev = readJsonSafe(DRAIN_FILE);
+  let exiting = false;
+  let panicAttempts = Number(drainPrev?.attempts ?? 0);
+  if (drainPrev && (drainPrev.status === "draining" || drainPrev.status === "budget-exhausted")) {
+    if ((drainPrev.curve ?? "").toLowerCase() === a.curve.toLowerCase() && (drainPrev.token ?? "").toLowerCase() === a.token.toLowerCase()) {
+      exiting = true;
+      console.log(`♻️ resume «حالت تخلیه» از ژورنال پایدار: ${DRAIN_FILE} (تلاش‌های قبلی: ${panicAttempts}${drainPrev.status === "budget-exhausted" ? " — بودجه‌ی قبلی تمام شده بود؛ برای تلاش بیشتر --panic-max-attempts بزرگ‌تر بده" : ""})`);
+    } else {
+      console.warn(`⚠️ ژورنال تخلیه‌ی دیگری روی دیسک است (${drainPrev.curve}/${drainPrev.token}) که با این اجرا یکی نیست — نادیده گرفته شد.`);
+    }
+  }
+  const saveDrain = (status, extra = {}) => atomicWriteJson(DRAIN_FILE, {
+    status, attempts: panicAttempts, curve: a.curve, token: a.token, chainId: CHAIN.id, updatedAt: new Date().toISOString(), ...extra,
+  });
+
   while (true) {
-    if (maxMin > 0 && (Date.now() - t0) / 60000 > maxMin) { console.log("⌛ پایان پنجره‌ی زمانی بدون تریگر"); return; }
+    const timedOut = maxMin > 0 && (Date.now() - t0) / 60000 > maxMin;
     try {
       // ── فاز تخلیه (پس از شروع خروج): شرط سود دیگر معنا ندارد؛ فقط ولت‌های دارای توکن می‌مانند ──
       if (exiting) {
-        let totalLeft = 0n;
+        if (timedOut) {
+          // ممیزی ۴: اتمام زمانِ --max-minutes «در وسط تخلیه» موفقیت نیست — کد ۲ + ژورنال برای resume
+          console.log(`⌛ پایان پنجره‌ی زمانی (--max-minutes ${maxMin}) در وسط تخلیه — تخلیه هنوز کامل نشده!\n   ژورنال تخلیه حفظ شد و اجرای بعدی همان‌جا ادامه می‌دهد: ${DRAIN_FILE} — اقدام دستی (sell.js) هم برای ولت‌های باقی‌مانده معتبر است.`);
+          saveDrain("draining", { note: "timeout" });
+          process.exitCode = 2;
+          return;
+        }
+        let totalLeft = 0n, readErrors = 0;
         const holders = [];
         for (const s of signers) {
-          try { const b = await token.balanceOf(s.address); if (b > 0n) { totalLeft += b; holders.push(s); } } catch {}
+          try { const b = await token.balanceOf(s.address); if (b > 0n) { totalLeft += b; holders.push(s); } } catch { readErrors++; }
+        }
+        if (readErrors > 0) {
+          // ممیزی ۴: خطای خواندن هرگز با «صفر» اشتباه نشود — «تخلیه‌ی کامل» فقط با همه‌ی خواندن‌های موفق
+          console.log(`⚠️ خطای RPC در خواندن موجودی ${readErrors} ولت — تأیید/ادامه‌ی تخلیه به تعویق افتاد (برای جلوگیری از «تکمیل کاذب»).`);
+          await sleep(Math.max(2000, interval));
+          continue;
         }
         if (holders.length === 0) {
-          console.log("\n✅ تخلیه‌ی کامل تأیید شد (موجودی توکن همه‌ی امضاکنندگان صفر است).");
+          console.log("\n✅ تخلیه‌ی کامل تأیید شد (موجودی توکن همه‌ی امضاکنندگان صفر است — همه‌ی خواندن‌ها موفق).");
+          saveDrain("complete");
           return;
         }
         panicAttempts++;
         console.log(`🔁 تخلیه ادامه دارد (تلاش ${panicAttempts}/${maxPanicAttempts}): ${holders.length} ولت هنوز توکن دارند…`);
+        saveDrain("draining", { holders: holders.map((h) => h.address) });
         if (panicAttempts > maxPanicAttempts) {
-          console.log(`⛔ خروج پس از ${maxPanicAttempts} تلاش کامل نشد. ولت‌های دارای موجودی:\n${holders.map((h) => h.address).join("\n")}\nاقدام دستی: sell.js یا (پس از گرجوئیشن) --ur-data مستقیم برای این ولت‌ها`);
+          console.log(`⛔ خروج پس از ${maxPanicAttempts} تلاش کامل نشد. ولت‌های دارای موجودی:\n${holders.map((h) => h.address).join("\n")}\nاقدام دستی: sell.js یا (پس از گرجوئیشن) --ur-data مستقیم برای این ولت‌ها. برای retry بیشتر: --panic-max-attempts بزرگ‌تر`);
+          saveDrain("budget-exhausted", { holders: holders.map((h) => h.address) });
           process.exitCode = 2;
           return;
         }
@@ -130,6 +186,7 @@ async function main() {
         await sleep(Math.max(2000, interval));
         continue;
       }
+      if (timedOut) { console.log("⌛ پایان پنجره‌ی زمانی بدون تریگر (در فاز رصد — بدون تخلیه‌ی باز)"); return; }
 
       // ۱) معاملات تازه — برای سرمایه، فلوت و قیمت (همه از یک اسکن)
       const trades = await curveTrades(a.curve, fromBlock);
@@ -151,10 +208,11 @@ async function main() {
       if (!(spentEth > 0)) { console.log("— هنوز خرید خودی‌ای دیده نمی‌شود — صبر…"); await sleep(interval); continue; }
 
       // ۳) موجودی زنده‌ی توکن خودی‌ها
-      let totTokensWei = 0n;
+      let totTokensWei = 0n, balErrs = 0;
       for (const s of signers) {
-        try { totTokensWei += await token.balanceOf(s.address); } catch {}
+        try { totTokensWei += await token.balanceOf(s.address); } catch { balErrs++; }
       }
+      if (balErrs > 0) console.log(`⚠️ خطای RPC در خواندن موجودی ${balErrs}/${signers.length} ولت — محاسبه‌ی این چرخه روی داده‌ی ناقص است (رصد ادامه، تصمیم‌گیری با احتیاط).`);
       if (totTokensWei === 0n) { console.log("— موجودی توکن خودی صفر است (خارج شده؟) — صبر…"); await sleep(interval); continue; }
 
       // ۳+۴) محاسبه با «واحد خام» توکن — مستقل از decimals توکن (برای ۱۸رقمی دقیقاً همان نتیجه‌ی قبل)
@@ -205,7 +263,8 @@ async function main() {
         if (pres.fail > 0) {
           // شروع حالت تخلیه: از این نقطه شرط سود دیگر تنظیم‌کننده نیست و ولت‌های دارای توکن تا پایان جنگیده می‌شوند
           exiting = true;
-          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق — حالت تخلیه فعال شد؛ رصد/تخلیه بدون شرط سود ادامه دارد…`);
+          saveDrain("draining", { triggerProfitPct: Number(profitPct.toFixed(2)) }); // پایدار — کرش این‌جا تخلیه را متوقف نمی‌کند
+          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق — حالت تخلیه فعال شد؛ رصد/تخلیه بدون شرط سود ادامه دارد… (ژورنال تخلیه: ${DRAIN_FILE})`);
           continue;
         }
         console.log(`💵 بازده کل واقعی پس از خروج (عایدی قبلی + دلتای این خروج): ${(proceedsEth + received).toFixed(4)} ETH${spentEth > 0 ? ` = ${((proceedsEth + received) / spentEth).toFixed(2)}× سرمایه (سود واقعی ${(((proceedsEth + received) / spentEth - 1) * 100).toFixed(0)}٪)` : ""}`);

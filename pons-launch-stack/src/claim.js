@@ -1,16 +1,21 @@
 // کلیم فی از FeeEscrow — ولت کلیمر جدا از کریتور است (الگوی موج دوم فارم)
 // توجه: creatorFeeRecipient لانچ باید برابر ولت کلیمر باشد تا این اسکریپت بتواند claim کند
 // کلیم اتوماتیک (پول هر دقیقه) با --watch انجام می‌شود؛ هر کلیم ~۰٫۰۰۰۳ ETH گس دارد
+// ممیزی ۴:
+// - پیش‌فرض --all «فقط مانیتورینگ» است (بدون کلیم مستر/کارگرها)؛ کلیم واقعی آن‌ها با --all-claim صریح انجام می‌شود
+// - هر شکست در اجرای تک‌بار = کد ۱ (فلش موفقیت کاذب به اسکریپت بالادستی داده نمی‌شود)
+// - حالت --watch لاک اجرایی دارد (دو watcher هم‌زمان ⇒ دوبرابر کلیم/گس)
+// - preflight: FeeEscrow واقعاً قرارداد است
 import { Contract, ethers } from "ethers";
-import { ADDR, env, parseArgs } from "./config.js";
+import { ADDR, WALLETS_OUT, env, parseArgs } from "./config.js";
 import { FEE_ESCROW_ABI } from "./abis.js";
-import { claimerWallet, masterWallet, deriveWorkers, workerStart, truthy, fmt, sleep } from "./lib.js";
+import { claimerWallet, masterWallet, deriveWorkers, workerStart, truthy, fmt, sleep, acquireRunLock, releaseRunLock, assertContract } from "./lib.js";
 
-async function claimOnce(signer, label = "") {
+async function claimOnce(signer, label = "", { doClaim = true } = {}) {
   const escrow = new Contract(ADDR.FEE_ESCROW, FEE_ESCROW_ABI, signer);
   const bal = await escrow.balanceOf(signer.address);
-  console.log(`${label} → ${signer.address} | claimable: ${fmt(bal)} ETH`);
-  if (bal === 0n) return BigInt(0);
+  console.log(`${label} → ${signer.address} | claimable: ${fmt(bal)} ETH${doClaim ? "" : " (فقط مانیتورینگ — کلیم نمی‌شود)"}`);
+  if (!doClaim || bal === 0n) return BigInt(0);
   // توجه: escrow دو اورلود claim دارد (claim/claim(amount)) — باید صریح انتخاب شود
   const tx = await escrow.getFunction("claim()")();
   await tx.wait();
@@ -25,22 +30,37 @@ async function main() {
   const sweepTreasury = truthy(a.sweep);
   const sweepAll = truthy(a["sweep-all"]); // مُد قدیمی: «کل» موجودی، نه فقط دلتای کلیم
   const intervalMs = Number(env("CLAIM_INTERVAL_MS", "60000"));
-  const all = truthy(a.all); // علاوه بر کلیمر، مستر و کارگرها هم چک شوند (مانیتورینگ)
+  if (!Number.isFinite(intervalMs) || intervalMs < 5000) { console.log("⛔ CLAIM_INTERVAL_MS باید ≥ 5000 میلی‌ثانیه باشد"); process.exit(1); }
+  const all = truthy(a.all);           // مانیتورینگِ مستر/کارگرها (فقط نمایش claimable)
+  const allClaim = truthy(a["all-claim"]); // کلیم واقعی برای مستر/کارگرها — صریح و جدا
+
+  // preflight: FeeEscrow قرارداد است؟ (ممیزی ۴)
+  await assertContract(ADDR.FEE_ESCROW, "FeeEscrow");
+
+  // لاک اجرا برای حالت watcher — دو فرایند کلیم هم‌زمان ممنوع
+  let locked = false;
+  if (watch) {
+    acquireRunLock(`${WALLETS_OUT}/claim.lock`, { globalKey: `pons-claim-${claimerWallet().address}` });
+    locked = true;
+  }
 
   const claimer = claimerWallet();
   console.log("کلیمر (ولت فی‌رسپینت):", claimer.address);
 
-  // --all: کلیمر «هم» در لیست است (کلیمر اصلیِ کلیم) + مستر و کارگرها برای مانیتورینگ
+  // --all: کلیمر (کلیم واقعی) + مستر و کارگرها (پیش‌فرض: فقط مانیتورینگ | با --all-claim: کلیم)
   const targets = [];
-  if (all) targets.push(claimer, masterWallet(), ...(() => { try { return deriveWorkers(Number(env("WORKER_COUNT", "28")), workerStart(a)).map((w) => w.wallet); } catch { return []; } })());
+  if (all || allClaim) targets.push(claimer, masterWallet(), ...(() => { try { return deriveWorkers(Number(env("WORKER_COUNT", "28")), workerStart(a)).map((w) => w.wallet); } catch { return []; } })());
   else targets.push(claimer);
+  if (all && !allClaim) console.log(`ℹ️ --all برای مستر/کارگرها فقط «مانیتورینگ» است — برای کلیم واقعی آن‌ها: --all-claim`);
 
+  let failures = 0;
   do {
     for (const s of targets) {
       try {
-        const claimed = await claimOnce(s, s === claimer ? "FEE" : "—");
+        const doClaim = s === claimer || allClaim;
+        const claimed = await claimOnce(s, s === claimer ? "FEE" : "—", { doClaim });
         if (claimed > 0n && sweepTreasury && env("TREASURY_ADDRESS")) {
-          if (!ethers.isAddress(env("TREASURY_ADDRESS"))) { console.log("⛔ TREASURY_ADDRESS نامعتبر است"); continue; }
+          if (!ethers.isAddress(env("TREASURY_ADDRESS"))) { console.log("⛔ TREASURY_ADDRESS نامعتبر است"); failures++; continue; }
           let b = await s.provider.getBalance(s.address);
           const reserve = ethers.parseEther("0.0001");
           if (b > reserve) {
@@ -57,12 +77,17 @@ async function main() {
           }
         }
       } catch (e) {
+        failures++;
         console.log("خطای کلیم:", e.shortMessage ?? e.message);
       }
     }
     if (!watch) break;
     await sleep(intervalMs);
   } while (true);
+
+  if (locked) releaseRunLock(`${WALLETS_OUT}/claim.lock`);
+  // ممیزی ۴: اجرای تک‌بار با هر شکستی کد ۱ می‌گیرد (watcher همچنان ادامه دارد و فقط شمارش می‌کند)
+  if (!watch && failures > 0) { console.log(`⛔ کلیم با ${failures} شکست تمام شد`); process.exit(1); }
 }
 
 main().catch((e) => { console.error("❌", e.shortMessage ?? e.message); process.exit(1); });

@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import { Wallet, isAddress } from "ethers";
 import { WALLETS_OUT, CHAIN, env, parseArgs } from "./config.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, legacyHd, eth, fmt, gasPrice, weiOf, splitWeiRandom, sleep, nowTag, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, legacyHd, eth, fmt, gasPrice, weiOf, resolveBatchAllocation, sleep, nowTag, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock } from "./lib.js";
 
 const FUND_JOURNAL = `${WALLETS_OUT}/fund_journal.json`;
 const FUND_LOCK = `${WALLETS_OUT}/fund.lock`;
@@ -59,10 +59,7 @@ async function main() {
     const workers = deriveWorkers(Number(a.workers ?? env("WORKER_COUNT", "28")), workerStart(a), { legacy });
     if (legacy) console.log("🕰️ --legacy-hd فعال: ولت‌های مقصد = مسیر قدیمی اشتباه (فقط بازیابی لانچ‌های پیشین)");
     const totalWei = weiOf(total);
-    const minShareWei = a["min-share"] ? weiOf(Number(a["min-share"])) : 0n;
-    let amountsWei;
-    try { amountsWei = splitWeiRandom(totalWei, workers.length, minShareWei); }
-    catch (e) { console.log("⛔ تخصیص غیرممکن:", e.message); process.exit(1); }
+    const minShareWei = a["min-share"] ? weiOf(String(a["min-share"])) : 0n;
     const master = masterWallet();
     const force = truthy(a.force);
 
@@ -75,8 +72,35 @@ async function main() {
     if (journal.meta?.master && journal.meta.master.toLowerCase() !== master.address.toLowerCase()) {
       console.log(`⛔ ژورنال شارژ متعلق به مستر ${journal.meta.master} است ولی مستر فعلی ${master.address} — نادیده‌گرفتن این موجب شارژ/اسکیپ اشتباه می‌شود. (--fresh برای ژورنال جدید)`); process.exit(1);
     }
-    if (truthy(a.fresh)) { journal.meta = { chainId: CHAIN.id, master: master.address, program: "fund" }; journal.entries = {}; console.log("--fresh: ژورنال تازه"); }
+    if (truthy(a.fresh)) { journal.meta = { chainId: CHAIN.id, master: master.address, program: "fund" }; journal.entries = {}; journal.alloc = null; console.log("--fresh: ژورنال تازه"); }
     if (!journal.meta?.master) { journal.meta = { chainId: CHAIN.id, master: master.address, program: "fund" }; }
+
+    // ─── نقشه‌ی تخصیص منجمد (ممیزی ۴): resume هرگز سهم‌ها را دوباره تصادفی نمی‌کند ───
+    const recipients = workers.map((w) => w.address);
+    let amountsWei;
+    {
+      const r = resolveBatchAllocation({ journal, fresh: truthy(a.fresh), recipients, totalWei, minShareWei });
+      if (!r.ok) {
+        if (r.reason === "alloc-missing-on-resume") {
+          // ژورنال قدیمی بدون نقشه‌ی منجمد: فقط اگر همه‌ی ولت‌ها «تأییدشده»‌اند می‌شود ادامه داد (سهم‌ها از خودِ ژورنال بازتولید می‌شوند)
+          const done = (e) => e && e.valueWei && (e.state === "ok" || e.state === "ok-balance-verified" || e.state === "legacy");
+          if (!recipients.every((addr) => done(journal.entries[addr]))) {
+            console.log(`⛔ ژورنال شارژ قبلی رکورد دارد ولی «نقشه‌ی تخصیص منجمد (alloc)» ندارد و هنوز ولت‌های شارژنشده/نامعلوم هست — resume غیرامن.
+   گزینه‌ی امن: برای ولت‌های نامعلوم دستی وضعیت را روشن کن؛ اگر واقعاً می‌خواهی از صفر شارژ کنی (سهم‌های قبلی دوباره ارسال می‌شوند!) عمداً --fresh بزن.`);
+            process.exit(1);
+          }
+          amountsWei = recipients.map((addr) => BigInt(journal.entries[addr].valueWei));
+          console.log("♻️ resume «کاملاً شارژشده» — سهم‌ها از رکوردهای قبلی ژورنال بازتولید شدند (ارسالِ تازه فقط در صورت ناکامی وریفای)");
+        } else {
+          console.log(`⛔ نقشه‌ی تخصیص ژورنال با لیست ولت‌های این اجرا یکی نیست (${r.reason}) — resume غیرامن. یا همان لیست/فلگ‌ها (--workers/--worker-start/--legacy-hd) را بده یا عمداً --fresh (شارژ دوباره از صفر!).`);
+          process.exit(1);
+        }
+      } else {
+        amountsWei = r.amountsWei;
+        if (r.source === "frozen") console.log(`♻️ resume با نقشه‌ی تخصیص منجمد‌شده‌ی ژورنال (همان ${journal.alloc.totalEth} ETH اجرای اول)`);
+        if (r.journalAlloc) { journal.alloc = r.journalAlloc; saveJournal(journal); }
+      }
+    }
 
     console.log(`💸 شارژ گس ${workers.length} ولت با مجموع ${total} ETH از مستر${force ? " (--force: شارژ دوباره‌ی ژورنال‌شده‌ها)" : ""}`);
     const bal = await provider.getBalance(master.address);
@@ -84,8 +108,8 @@ async function main() {
       console.log(`⛔ موجودی مستر کافی نیست: ${fmt(bal)} ETH < ${total + 0.005} ETH`);
       process.exit(1);
     }
-    // run-lock: دو فرایند fund هم‌زمان ممنوع (مشابه batch_buy)
-    acquireRunLock(FUND_LOCK, { force, forceLivePid: truthy(a["force-live-pid"]) });
+    // run-lock: دو فرایند fund هم‌زمان ممنوع — محلی (این پوشه) + سراسری (هر نسخه‌ی پروژه روی همین مستر/چین)
+    acquireRunLock(FUND_LOCK, { force, forceLivePid: truthy(a["force-live-pid"]), globalKey: `pons-fund-${CHAIN.id}-${master.address}` });
 
     let okCount = 0, skipCount = 0, failCount = 0;
     for (let i = 0; i < workers.length; i++) {
@@ -126,7 +150,7 @@ async function main() {
       try {
         const tx = await master.sendTransaction({ to: w.address, value, gasPrice: gp });
         // ← ثبت «نیت» بلافاصله بعد از broadcast: کرش اینجا رسید نمی‌سازد ولی هش در ژورنال است
-        journal.entries[w.address] = { valueWei: value.toString(), tx: tx.hash, at: new Date().toISOString(), state: "broadcast" };
+        journal.entries[w.address] = { valueWei: value.toString(), tx: tx.hash, nonce: tx.nonce, at: new Date().toISOString(), state: "broadcast" };
         saveJournal(journal);
         try {
           await tx.wait(1, 120000);

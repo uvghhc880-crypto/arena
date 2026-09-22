@@ -10,7 +10,7 @@ import fs from "node:fs";
 import { Contract, Interface, Wallet, id, isAddress, formatUnits } from "ethers";
 import { ADDR, CHAIN, LAUNCHES_DIR, env, parseArgs } from "./config.js";
 import { BONDING_CURVE_ABI, ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, weiOf, resolveBatchAllocation, nowTag, sleep, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, weiOf, resolveBatchAllocation, nowTag, sleep, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock, assertContract } from "./lib.js";
 import { panicSellAll, marketPrice, estMinOut } from "./market.js";
 
 const MIN_BUY_ETH = 0.0005;
@@ -53,8 +53,8 @@ class ExternalGuard {
     this.minTxWei = minTxWei; this.windowBlocks = windowBlocks;
     this.base = fromBlock;
     this.nextFrom = fromBlock;
-    this.extCum = 0n; this.errors = 0; this.soft = soft;
-    this.seen = new Set(); // dedupe (txHash:logIndex) برای هم‌پوشانی reorg
+    this.confirmedCum = 0n; // فقط برای بلاک‌های تثبیت‌شده (قدیمی‌تر از REORG) — هر بلاک دقیقاً یک‌بار
+    this.errors = 0; this.soft = soft;
   }
   classify(lg) {
     try {
@@ -73,27 +73,44 @@ class ExternalGuard {
       for (const lg of logs) { const q = this.classify(lg); if (q) ext += q; }
       return ext;
     }
-    // انباشته: ۲ بلاک هم‌پوشانی برای reorg + dedupe (همان‌فیل دوبار شمرده نمی‌شود)
-    const from = Math.max(this.base, Number(this.nextFrom) - Number(REORG_DEPTH));
-    const logs = await provider.getLogs({ address: this.curveAddr, topics: [CURVE_BUY_TOPIC], fromBlock: from, toBlock: "latest" });
-    for (const lg of logs) {
-      const key = `${lg.transactionHash}:${lg.logIndex ?? lg.index}`;
-      if (this.seen.has(key)) continue;
-      this.seen.add(key);
-      const q = this.classify(lg);
-      if (q) this.extCum += q;
+    // انباشتهٔ reorg-safe واقعی (ممیزی ۴): دو لایه‌ی «تثبیت‌شده» و «جدید»
+    //   tier-confirmed: بلاک‌های قدیمی‌تر از REORG_DEPTH — یک‌بار پردازش می‌شوند و برای همیشه در confirmedCum می‌مانند
+    //   tier-recent: چند بلاک آخر — در «هر اسکن» از نو خوانده و از نو جمع می‌شوند (stateless)؛ orphan شدن‌شان هیچ اثری روی مجموع نمی‌گذارد
+    const REORG_N = Number(REORG_DEPTH);
+    const confirmUpto = latest - REORG_N;
+    // لایه‌ی تثبیت‌شده: جلو می‌رویم تا سقف confirmUpto
+    if (this.nextFrom <= confirmUpto) {
+      const logsA = await provider.getLogs({ address: this.curveAddr, topics: [CURVE_BUY_TOPIC], fromBlock: this.nextFrom, toBlock: confirmUpto });
+      for (const lg of logsA) { const q = this.classify(lg); if (q) this.confirmedCum += q; }
+      this.nextFrom = confirmUpto + 1;
     }
-    this.nextFrom = BigInt(latest) + 1n;
-    return this.extCum;
+    // لایه‌ی جدید: از ٔسقف+۱ تا latest — هر اسکن کامل از نو
+    let recent = 0n;
+    const bFrom = Math.max(this.base, this.nextFrom);
+    if (bFrom <= latest) {
+      const logsB = await provider.getLogs({ address: this.curveAddr, topics: [CURVE_BUY_TOPIC], fromBlock: bFrom, toBlock: latest });
+      for (const lg of logsB) { const q = this.classify(lg); if (q) recent += q; }
+    }
+    return this.confirmedCum + recent;
   }
 }
 
 async function resolveFromBlock(a, { quiet = false } = {}) {
   if (a["launch-tx"]) {
+    let rc = null;
     try {
-      const rc = await provider.getTransactionReceipt(a["launch-tx"]);
-      if (rc) return rc.blockNumber;
-    } catch {}
+      rc = await provider.getTransactionReceipt(a["launch-tx"]);
+    } catch (e) {
+      // ممیزی ۴: خطای RPC روی resolve بلاک لانچ ⇒ fail-closed — «حدس زدن latest-500» سکوت‌آمیز بود
+      console.log(`⛔ خطای RPC هنگام خواندن رسید --launch-tx: ${(e.shortMessage ?? e.message).slice(0, 80)}\n   به‌جای حدس‌زدن بلاک شروع، متوقف شدم — RPC را چک کن یا --from-block صریح بده.`);
+      process.exit(1);
+    }
+    if (rc) return rc.blockNumber;
+    if (!a["from-block"]) {
+      console.warn(`⚠️ --launch-tx داده شده ولی رسیدی در زنجیره نیست (هنوز ماین نشده یا هش اشتباه) و --from-block هم نداری؛\n   اسکن فقط از ۵۰۰ بلاک اخیر انجام می‌شود — سرمایه/دیتای قدیمی‌تر دیده نمی‌شود! برای اطمینان --from-block صریح بده.`);
+      const latest = await provider.getBlockNumber();
+      return Math.max(0, latest - 500);
+    }
   }
   if (a["from-block"]) return Number(a["from-block"]);
   const latest = await provider.getBlockNumber();
@@ -221,9 +238,11 @@ async function main() {
   const totalEth = watchOnly ? 0 : numOpt(a.total, 0, { min: 0.0001, max: 1000, name: "total" });
   const totalWei = weiOf(totalEth);
   const slippageBps = numOpt(a["slippage-bps"], Number(env("SLIPPAGE_BPS", "800")), { min: 0, max: 5000, name: "slippage-bps" });
-  const panicConcurrency = Math.max(1, Number(a["panic-concurrency"] ?? 6));
+  const panicConcurrency = Math.min(20, Math.max(1, Number(a["panic-concurrency"] ?? 6)));
   const minShareEth = numOpt(a["min-share"], MIN_BUY_ETH, { min: 0.000001, name: "min-share" });
   const guardSoft = truthy(a["guard-soft"]);
+  const noGuard = truthy(a["no-guard"]); // --no-guard در README مستند است — این‌جا هم واقعاً اعمال می‌شود
+  if (noGuard && circuit !== null) console.warn("⚠️ --no-guard: گارد خرید خارجی هم با وجود آستانه‌ی تنظیم‌شده «خاموش» اعلام شد — خرید بدون هیچ محافظتی ادامه می‌یابد");
   const pendingTimeoutMs = clampInt(a["pending-timeout-ms"], 120000, 1000, 1800000);
 
   function clampInt(v, def, min, max) {
@@ -236,16 +255,37 @@ async function main() {
   try { selfSet.add(masterWallet().address.toLowerCase()); } catch {}
 
   const fromBlock = await resolveFromBlock(a, { quiet: a["external-abort-eth"] === undefined });
-  const guard = circuit !== null
+  const guard = circuit !== null && !noGuard
     ? new ExternalGuard(a.curve, fromBlock, selfSet, {
-        minTxWei: a["min-ext-tx"] ? weiOf(Number(a["min-ext-tx"])) : 0n,
+        minTxWei: a["min-ext-tx"] ? weiOf(String(a["min-ext-tx"])) : 0n,
         windowBlocks: Math.max(0, Number(a["window-blocks"] ?? 0)),
         soft: guardSoft,
       })
     : null;
   if (guard) console.log(`🛡️ گارد خارجی فعال: آستانه ${circuit} ETH | اسکن افزایشی (reorg-safe) از بلاک ${fromBlock} | خطای RPC: ${guardSoft ? "۳ بار تحمّل" : "توقف فوری"}`);
+  else if (circuit !== null && noGuard) console.warn("   (گارد با --no-guard غیرفعال — آستانه فقط در لاگ اولیه نمایش داده می‌شود)");
 
-  const gradCheck = stopOnGrad && !dryRun ? await buildGraduationChecker(a.curve) : null;
+  // ممیزی ۴ — چک گرجوئیشن fail-open روی خطای RPC بود؛ ابزار fail-closed می‌سازیم:
+  // با --stop-on-grad، خطای خواندن وضعیت گرجوئیشن = «گرجوئیشن نامعلوم» ⇒ بنابر محافظ، خرید ادامه نمی‌یابد.
+  const gradCheckBase = stopOnGrad && !dryRun ? await buildGraduationChecker(a.curve) : null;
+  let gradRpcFailures = 0;
+  const gradCheck = gradCheckBase
+    ? async () => {
+        try {
+          const g = await gradCheckBase();
+          gradRpcFailures = 0;
+          return g;
+        } catch (e) {
+          gradRpcFailures++;
+          console.log(`⚠️ خطای RPC در چک گرجوئیشن (${gradRpcFailures}مین پیاپی): ${(e.shortMessage ?? e.message).slice(0, 60)}`);
+          if (gradRpcFailures >= 3) {
+            console.log("⛔ وضعیت گرجوئیشن پشت‌سرهم «نامعلوم» ماند — با --stop-on-grad ادامه‌ی خرید روی داده‌ی نامطمئن مجاز نیست (fail-closed)");
+            return { graduated: true, how: "rpc-unknown-failclosed" };
+          }
+          return { graduated: false }; // سه خطای اول تحمل، چهارم fail-closed
+        }
+      }
+    : null;
 
   // جزییات تراکنش در تعلیق رصد می‌شود
   let guardTripped = null; // null | "external-guard" | "guard-rpc-error"
@@ -314,10 +354,17 @@ async function main() {
     if (circuit === null) { console.log("--watch-only بدون --external-abort-eth معنا ندارد"); process.exit(1); }
     const minutes = Number(a["watch-minutes"] ?? 30);
     const interval = Number(a["watch-interval"] ?? 1500);
+    // اعتبارسنجی فلگ‌های عددی (ممیزی ۴): حلقه‌ی بینهایت/فوری = فاجعه
+    if (!Number.isFinite(minutes) || minutes <= 0) { console.log("⛔ --watch-minutes باید عدد مثبت باشد"); process.exit(1); }
+    if (!Number.isFinite(interval) || interval < 200) { console.log("⛔ --watch-interval باید ≥ 200ms باشد"); process.exit(1); }
     console.log(`👁️ حالت دیده‌بان: هر ${interval}ms تا ${minutes} دقیقه…`);
     const t0 = Date.now();
     while ((Date.now() - t0) / 60000 < minutes) {
-      if (await guardCheck("watch")) process.exitCode = 0; return;
+      if (await guardCheck("watch")) {
+        console.log("🚨 دیده‌بان: تریگر آستانه‌ی خرید خارجی شلیک شد (خروج با کد 2)");
+        process.exitCode = 2; // تریگر واقعی — با «پایان طبیعی پایش» (کد 0) اشتباه نشود
+        return;
+      }
       if (await gradReached("watch")) { console.log("⌛ پایان دیده‌بان — گرجوئیشن رسید"); process.exitCode = 0; return; }
       await sleep(interval);
     }
@@ -326,7 +373,13 @@ async function main() {
   }
 
   // ---------------- بچ‌بای ----------------
-  acquireRunLock(LOCK_FILE, { force: truthy(a.force), forceLivePid: truthy(a["force-live-pid"]) });
+  // preflight: مقصدهای پول واقعاً قراردادند؟ (ممیزی ۴ — ارسال به EOA بدون کد = سوختن پول)
+  await assertContract(a.curve, "باندینگ-کرو");
+  await assertContract(a.token, "توکن");
+  acquireRunLock(LOCK_FILE, {
+    force: truthy(a.force), forceLivePid: truthy(a["force-live-pid"]),
+    globalKey: `pons-batch-${CHAIN.id}-${master.address}`, // لاک سراسری: رقابت بین دو نسخه‌ی پروژه روی یک مستر/چین
+  });
   const REL = () => releaseRunLock(LOCK_FILE);
   console.log("🔴 MAINNET — پول واقعی در جریان است (پیش از این، --dry-run را کامل دیده‌ای؟)");
 
@@ -335,6 +388,15 @@ async function main() {
   const minOutFlag = a["min-out"] !== undefined ? BigInt(a["min-out"]) : null;
   const allowZeroMinOut = truthy(a["allow-zero-minout"]) || minOutFlag === 0n;
   const perDelay = Number(a.delay ?? 100);
+  // اعتبارسنجی فلگ‌های عددی (ممیزی ۴)
+  const numDie = (msg) => { console.log("⛔", msg); REL(); process.exit(1); };
+  if (!Number.isFinite(perDelay) || perDelay < 0 || perDelay > 600_000) numDie("--delay باید بین ۰ و ۶۰۰٬۰۰۰ میلی‌ثانیه باشد");
+  {
+    const wCount = Number(a.workers ?? env("WORKER_COUNT", "28"));
+    if (!recipients.length && (!Number.isInteger(wCount) || wCount < 1 || wCount > 250)) numDie("--workers باید عدد صحیح بین ۱ و ۲۵۰ باشد");
+  }
+  if (!Number.isFinite(Number(a["panic-concurrency"] ?? 6)) || Number(a["panic-concurrency"] ?? 6) < 1 || Number(a["panic-concurrency"] ?? 6) > 20) numDie("--panic-concurrency باید بین ۱ و ۲۰ باشد");
+  if (!Number.isFinite(Number(a["pending-timeout-ms"] ?? 120000)) || Number(a["pending-timeout-ms"] ?? 120000) < 10000) numDie("--pending-timeout-ms باید ≥ ۱۰٬۰۰۰ باشد");
   const curve = new Contract(a.curve, BONDING_CURVE_ABI, payer);
   const tokenRead = new Contract(a.token, ERC20_ABI, provider);
   let tokDec = 18;
@@ -362,7 +424,14 @@ async function main() {
   try {
     // dry-run همان محدودیت min-share واقعی را می‌سنجد (dryRun:false برای allocation — parity کامل با اجرای واقعی)
     const r = resolveBatchAllocation({ journal: existing, fresh, recipients, totalWei, minShareWei, dryRun: false });
-    if (!r.ok) { console.log(`⛔ نقشه‌ی تخصیص ژورنال با recipientهای این اجرا یکی نیست — resume غیرامن. یا همان لیست را بده یا --fresh.`); REL(); process.exit(1); }
+    if (!r.ok) {
+      const why = r.reason === "alloc-missing-on-resume"
+        ? `⛔ ژورنال قبلی تراکنش ثبت‌شده دارد ولی «نقشه‌ی تخصیص منجمد (alloc)» ندارد (از نسخه‌ی قدیمی‌تر ساخته شده).
+   برای جلوگیری از خرید دوباره/سهم‌های متفاوت، وارد resume تازه نمی‌شوم.
+   گزینه‌ها: (۱) اگر همه‌ی ژورنال قبلی باید ماست: با همین پوشه و بدون تغییر فلگ، --fresh را فقط وقتی بزن که واقعاً می‌خواهی خرید از صفر عایق انجام شود (سهم‌های قبلی دوباره ارسال می‌شوند!).`
+        : `⛔ نقشه‌ی تخصیص ژورنال با recipientهای این اجرا یکی نیست — resume غیرامن. یا همان لیست را بده یا --fresh (خرید دوباره از صفر — فقط عمدی).`;
+      console.log(why); REL(); process.exit(1);
+    }
     amountsWei = r.amountsWei;
     if (r.source === "frozen") console.log(`♻️ resume با نقشه‌ی تخصیص منجمد‌شده‌ی ژورنال (مجموع ${existing.alloc.totalEth} ETH — همان اجرای اول)`);
     resolvedAlloc = r.journalAlloc ?? null;
@@ -479,7 +548,7 @@ async function main() {
   async function waitAndRecord(target, quoteIn, tx) {
     // ← ثبت «نیت» بلافاصله بعد از broadcast: اگر الان کرش کنیم، هشِ معلقِ ما در ژورنال است و resume تعیین‌تکلیفش می‌کند
     journal.failed = (journal.failed ?? []).filter((e) => e.tx !== tx.hash);
-    journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, status: "broadcast", intent: true, at: new Date().toISOString() });
+    journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, nonce: tx.nonce, status: "broadcast", intent: true, at: new Date().toISOString() });
     J();
     const dropIntent = () => { journal.failed = journal.failed.filter((e) => !(e.tx === tx.hash && e.intent)); };
     try {

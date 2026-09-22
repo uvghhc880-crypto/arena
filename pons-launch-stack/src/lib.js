@@ -111,52 +111,45 @@ export function splitRandom(totalEth, n, minShareEth = 0) {
 // ─── تقسیم دقیق BigInt: n سهم تصادفی، هرکدام ≥ minWei و جمع دقیقاً = totalWei ───
 // الگوریتم: وزن تصادفی + آب‌پرش (water-filling) صحیح؛ اگر total < n×min ⇒ خطای صریح (غیرممکن)
 // (رفع باگ گزارش‌شده «clamp سپس scale مجدد» در ممیزی دوم)
+// ممیزی ۵ — بازنویسی کامل با الگوریتم «cut-point» (uint256-safe):
+// هر ورودی معتبر تضمین‌شده: Σسهم == totalWei دقیقاً، و هر سهم ≥ minWei — بدون هیچ حالت استثنایی.
+// روش: excess = total − n×min را به‌صورت تصادفی بین n سهم پخش می‌کنیم (cut-point کافی‌تیک گردوخak را فقط +۱wei می‌دهد،
+// که هرگز سهمی را زیر min نمی‌برد چون هر سهم از قبل ≥ min است).
+import crypto from "node:crypto";
 export function splitWeiRandom(totalWei, n, minWei = 0n) {
   totalWei = BigInt(totalWei); minWei = BigInt(minWei);
   if (!Number.isInteger(n) || n < 1) throw new Error(`تعداد بخش نامعتبر: ${n}`);
+  if (n === 1) {
+    if (totalWei < minWei) throw new Error(`جمع (${fmt(totalWei)} ETH) از حداقل سهم (${fmt(minWei)} ETH) کمتر است`);
+    return [totalWei];
+  }
   if (totalWei < minWei * BigInt(n))
     throw new Error(`جمع (${fmt(totalWei)} ETH) کمتر از ${n} × حداقل سهم (${fmt(minWei)} ETH = جمع ${fmt(minWei * BigInt(n))}) است — قابل‌تخصیص نیست`);
-  const SCALE = 1000000n;
-  const w = Array.from({ length: n }, () => BigInt(Math.floor((Math.random() + 0.05) * 1000)) * SCALE);
+  const excess = totalWei - minWei * BigInt(n);
+  if (excess === 0n) return Array.from({ length: n }, () => minWei);
+  // وزن‌های تصادفی ۱۲۸بیتی (کافی برای نسبت‌های دقیق — خطای نسبت < ۱ wei)
+  const w = Array.from({ length: n }, () => BigInt("0x" + crypto.randomBytes(16).toString("hex")) + 1n);
   const wSum = w.reduce((a, b) => a + b, 0n);
-  let s = w.map((wi) => (totalWei * wi) / wSum);
-  // گردوخاکِ گردکردن را به بزرگ‌ترین سهم بده تا جمع دقیق شود
+  const s = w.map((wi) => minWei + (excess * wi) / wSum);
+  // گردوخاک: هر floor حداکثر ۱wei کم کرده ⇒ باقی‌مانده < n؛ +۱wei به هر سهمِ باقی (هر سهم ≥ min بوده، پس امن)
   let rem = totalWei - s.reduce((a, b) => a + b, 0n);
-  if (rem !== 0n) {
-    let imax = 0; for (let i = 1; i < n; i++) if (s[i] > s[imax]) imax = i;
-    s[imax] += rem;
-  }
-  // آب‌پرش: کسری سهم‌های < minWei را از مازاد سهم‌های > minWei به نسبت مازاد برمی‌داریم (صحیح، حداکثر n دور)
-  for (let iter = 0; iter <= n; iter++) {
-    let deficit = 0n, surplus = 0n;
-    for (const x of s) { if (x < minWei) deficit += minWei - x; else surplus += x - minWei; }
-    if (deficit === 0n) break;
-    // اول سهم‌های زیر مین را ببَر به مین
-    for (let i = 0; i < n; i++) if (s[i] < minWei) s[i] = minWei;
-    // حالا deficit را از surplusها برمی‌داریم
-    if (surplus === 0n) throw new Error("تخصیص غیرممکن (surplus=0)"); // نباید رخ دهد چون total ≥ n×min چک شد
-    let took = 0n;
-    for (let i = 0; i < n; i++) {
-      if (took >= deficit) break;
-      const avail = s[i] > minWei ? s[i] - minWei : 0n;
-      if (avail === 0n) continue;
-      let give = (deficit * avail) / surplus;
-      if (give === 0n) give = avail >= deficit - took ? deficit - took : avail; // گردوخاک: از سهم‌های آخر بردار
-      if (give > avail) give = avail;
-      s[i] -= give; took += give;
+  if (rem > 0n) {
+    // به ترتیب شافل‌شده پخش کن (عدالت) — یک‌وب به هریک تا پایان باقی‌مانده
+    const order = Array.from({ length: n }, (_, i) => i);
+    for (let i = n - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+    let idx = 0;
+    while (rem > 0n) { s[order[idx % n]] += 1n; rem -= 1n; idx++; }
+  } else if (rem < 0n) {
+    // نظریتاً ناممکن (floor فقط کم می‌کند نه زیاد) ولی برای امنیت: از بزرگ‌ترین‌ها کم کن
+    const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => (s[b] > s[a] ? 1 : s[b] < s[a] ? -1 : 0));
+    let idx = 0;
+    while (rem < 0n) {
+      const i = order[idx % n];
+      if (s[i] > minWei) { s[i] -= 1n; rem += 1n; }
+      idx++;
+      if (idx > n * n) throw new Error("اشکال داخلی در موازنه‌ی گردوخاک splitWeiRandom");
     }
   }
-  // تطبیق نهایی گردوخاک (به‌خاطر گردکردن نسبت‌ها) — روی بزرگ‌ترین سهم
-  rem = totalWei - s.reduce((a, b) => a + b, 0n);
-  if (rem !== 0n) {
-    let imax = 0; for (let i = 1; i < n; i++) if (s[i] > s[imax]) imax = i;
-    if (rem < 0n && s[imax] + rem < minWei) {
-      // به‌ندرت: اگر کسر از بزرگ‌ترین او را زیر مین برد، از دوم بزرگ‌ترین برمی‌داریم
-      const sorted = s.map((x, i) => [x, i]).sort((a, b) => (b[0] > a[0] ? 1 : -1));
-      for (const [, i] of sorted) if (s[i] + rem >= minWei) { s[i] += rem; rem = 0n; break; }
-    } else { s[imax] += rem; rem = 0n; }
-  }
-  if (rem !== 0n) throw new Error("اشکال داخلی در splitWeiRandom");
   return s;
 }
 
@@ -188,7 +181,15 @@ export function resolveBatchAllocation({ journal = null, fresh = false, recipien
     const alRecips = (al.recipients ?? []).map((x) => x.toLowerCase());
     const now = recipients.map((r) => r.toLowerCase());
     if (JSON.stringify(alRecips) !== JSON.stringify(now)) return { ok: false, reason: "alloc-recipients-mismatch" };
-    return { ok: true, source: "frozen", amountsWei: al.amountsWei.map((w) => BigInt(w)) };
+    // ممیزی ۵: نقشه‌ی منجمد هم اعتبارسنجی می‌شود (طول/عدم‌منفی/خوانایی BigInt) — ژورنال دست‌کاری‌شده قابل‌استفاده نیست
+    let frozen;
+    try {
+      if (!Array.isArray(al.amountsWei) || al.amountsWei.length !== recipients.length) return { ok: false, reason: "alloc-length-mismatch" };
+      frozen = al.amountsWei.map((w) => BigInt(w));
+      if (frozen.some((w) => w < 0n)) return { ok: false, reason: "alloc-negative" };
+      if (frozen.reduce((x, y) => x + y, 0n) <= 0n) return { ok: false, reason: "alloc-zero-total" };
+    } catch { return { ok: false, reason: "alloc-corrupt" }; }
+    return { ok: true, source: "frozen", amountsWei: frozen };
   }
   const amountsWei = splitWeiRandom(BigInt(totalWei), recipients.length, dryRun ? 0n : BigInt(minShareWei));
   return {
@@ -259,6 +260,10 @@ function globalLockPath(globalKey) {
 export function pidAlive(pid) {
   try { process.kill(Number(pid), 0); return true; } catch (e) { return e.code === "EPERM"; }
 }
+// ممیزی ۵: contention دیگر process.exit نمی‌کند — throw می‌شود تا کالر بتواند لاک‌های قبلاً گرفته‌شده را رول‌بک کند
+export class LockBusyError extends Error {
+  constructor(file, detail) { super(`run-lock فعال است (${file}): ${detail}`); this.code = "LOCK_BUSY"; this.file = file; }
+}
 function acquireOne(file, { token, force = false, forceLivePid = false }) {
   for (;;) {
     try {
@@ -273,12 +278,10 @@ function acquireOne(file, { token, force = false, forceLivePid = false }) {
       let prev = null; try { prev = JSON.parse(prevRaw); } catch {}
       if (!force) {
         const alive = prev?.pid && pidAlive(prev.pid);
-        console.log(`⛔ run-lock فعال است (${file}): ${prevRaw}${alive ? "\nPID مالک «زنده» است!" : ""}\nاگر اجرای قبلی واقعاً مرده، با --force دوباره بیا.`);
-        process.exit(1);
+        throw new LockBusyError(file, `${prevRaw}${alive ? " (مالک لاک «زنده» است!)" : ""}`);
       }
       if (prev?.pid && pidAlive(prev.pid) && !forceLivePid) {
-        console.log(`⛔ مالکِ لاک (PID ${prev.pid}) هنوز زنده است — --force مجاز نیست. اگر واقعاً مطمئنی: --force --force-live-pid`);
-        process.exit(1);
+        throw new LockBusyError(file, `مالک (PID ${prev.pid}) هنوز زنده است — --force مجاز نیست`);
       }
       console.warn(`⚠️ run-lock قبلی با --force نادیده گرفته شد (${file})`);
       try { fs.unlinkSync(file); } catch (e2) { if (e2.code !== "ENOENT") throw e2; }
@@ -289,17 +292,52 @@ function acquireOne(file, { token, force = false, forceLivePid = false }) {
 export function acquireRunLock(file, { force = false, forceLivePid = false, globalKey = null } = {}) {
   const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const files = [file, ...(globalKey ? [globalLockPath(globalKey)] : [])];
-  for (let i = 0; i < files.length; i++) {
-    try { acquireOne(files[i], { token, force, forceLivePid }); }
-    catch (e) {
-      // رول‌بک: لاک‌های تازه گرفته‌شده در همین فراخوان آزاد شوند
-      for (let j = 0; j < i; j++) { lockState.delete(files[j]); try { fs.unlinkSync(files[j]); } catch {} }
-      throw e;
-    }
+  try {
+    for (let i = 0; i < files.length; i++) acquireOne(files[i], { token, force, forceLivePid });
+  } catch (e) {
+    // رول‌بک کامل: لاک‌های تازه گرفته‌شده در همین فراخوان آزاد شوند (ممیزی ۵ — خروج بدون stale-lock محلی)
+    for (const f of files) { if (lockState.get(f) === token) { try { fs.unlinkSync(f); } catch {} lockState.delete(f); } }
+    if (e.code === "LOCK_BUSY") { console.log(`⛔ ${e.message}\nاگر اجرای قبلی واقعاً مرده، با --force دوباره بیا. (لاک‌های نیمه‌گرفته‌شده‌ی این اجرا آزاد شدند)`); process.exit(1); }
+    throw e;
   }
   lockGroups.set(file, files);
   process.on("exit", () => releaseRunLock(file));
   return token;
+}
+
+// ─── لاک سراسری «به‌ازای امضاکننده» (ممیزی ۵): همه‌ی عملیات یک یکی‌پول یک nonce می‌خواهند ───
+// هر ابزاری که قرار است با signer تراکنش بفرستد، اول لاک سراسری همان آدرس را می‌گیرد:
+// pons-signer-<chainId>-<address> — دو ابزار مختلف روی یکچیز هم‌زمان تراکنش نمی‌زنند.
+const signerLocksHeld = new Set(); // addr (lower)
+export async function acquireSignerLocks(signers, { chainId = CHAIN.id, force = false, forceLivePid = false, label = "", retryMs = 0 } = {}) {
+  const addrs = [...new Set(signers.map((s) => (typeof s === "string" ? s : s.address).toLowerCase()))].filter(Boolean);
+  const token = `signer-${process.pid}-${Date.now()}`;
+  const acquired = [];
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      for (const addr of addrs) {
+        if (signerLocksHeld.has(addr)) { acquired.push({ addr, skip: true }); continue; }
+        acquireOne(globalLockPath(`pons-signer-${chainId}-${addr}`), { token: `${token}-${addr}`, force, forceLivePid });
+        signerLocksHeld.add(addr);
+        acquired.push({ addr, skip: false });
+      }
+      break;
+    } catch (e) {
+      if (e.code !== "LOCK_BUSY" || Date.now() - t0 >= retryMs) throw e;
+      await sleep(1500);
+    }
+  }
+  if (acquired.some((x) => !x.skip) && label) console.log(`🔐 لاک سراسری امضاکننده‌ها گرفته شد (${acquired.filter((x) => !x.skip).length}/${addrs.length} آدرس) — ${label}`);
+  process.on("exit", () => releaseSignerLocks());
+  return addrs;
+}
+export function releaseSignerLocks() {
+  for (const addr of [...signerLocksHeld]) {
+    const f = globalLockPath(`pons-signer-${CHAIN.id}-${addr}`);
+    releaseOne(f, lockState.get(f));
+    signerLocksHeld.delete(addr);
+  }
 }
 export function releaseRunLock(file) {
   const group = lockGroups.get(file) ?? [file];

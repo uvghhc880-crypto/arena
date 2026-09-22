@@ -6,7 +6,7 @@ import path from "node:path";
 import { Contract, ethers } from "ethers";
 import { ADDR, CHAIN, LAUNCHES_DIR, env, parseArgs } from "./config.js";
 import { LAUNCH_AND_BUY_ABI } from "./abis.js";
-import { masterWallet, claimerWallet, deriveWorkers, workerStart, truthy, eth, fmt, nowTag, provider, normalizeBytes32, atomicWriteJson } from "./lib.js";
+import { masterWallet, claimerWallet, deriveWorkers, workerStart, truthy, eth, fmt, nowTag, provider, normalizeBytes32, atomicWriteJson, acquireSignerLocks, releaseSignerLocks } from "./lib.js";
 
 const FACTORY_V2_ABI = [
   "function launchToken((string name, string symbol, string logo, string description, (string twitter, string telegram, string discord, string website, string farcaster) socials, address creatorFeeRecipient, uint16 creatorTaxBps, bool buybackEnabled, bytes32 expectedEconomics, bytes32 salt) params, address pairToken, address factoryRef) payable",
@@ -103,7 +103,7 @@ async function main() {
     console.warn("⚠️ launchConfigId صفر فرض شد — اگر LaunchEconomicsMismatch دیدی مقدار درست را در .env بگذار.");
   }
 
-  // ولیو تراکنش = فی لانچ + مبلغ خرید اول — فی از «فکتوری» خوانده می‌شود؛ env فقط با --force-fee-env
+  // ولیو تراکنش = فی لانچ + مبلغ خرید اول — فی از «فکتوری» خوانده می‌شود؛ env فقط با اجازه‌ی صریح
   let launchFee = null;
   let onchainFee = null;
   try {
@@ -111,9 +111,15 @@ async function main() {
     onchainFee = await factoryRead.launchFee();
     launchFee = onchainFee;
     console.log(`ℹ️ فی لانچ آنچین (فکتوری): ${fmt(launchFee)} ETH`);
-  } catch {
+  } catch (e) {
+    // ممیزی ۵: برای عملیات مالی، خوانش فی نباید بی‌صدا به fallback دستی بگذرد — fail-closed
+    if (!truthy(a["allow-env-fee-fallback"])) {
+      console.log(`⛔ خواندن launchFee() از فکتوری ناموفق بود (${(e.shortMessage ?? e.message).slice(0, 80)}).
+   ادامه‌ی لانچ با فی حدسی ناامن است. اگر عمداً می‌خواهی از LAUNCH_FEE_ETH در .env استفاده کنی: --allow-env-fee-fallback`);
+      process.exit(1);
+    }
     launchFee = eth(env("LAUNCH_FEE_ETH", "0.0005"));
-    console.log(`ℹ️ فی لانچ fallback: ${fmt(launchFee)} ETH`);
+    console.log(`⚠️ فی لانچ fallback با اجازه‌ی صریح (--allow-env-fee-fallback): ${fmt(launchFee)} ETH`);
   }
   if (env("LAUNCH_FEE_ETH")) {
     const envFee = eth(env("LAUNCH_FEE_ETH"));
@@ -158,6 +164,8 @@ async function main() {
     process.exit(1);
   }
   console.warn("🧨 گیت LIVE با --i-am-live تأیید شد — ارسال واقعی لانچ:");
+  // ممیزی ۵: لاک سراسری امضاکننده (master) — تراکنش‌های لانچ/سایر ابزارها روی nonce یکی‌پول قفل می‌شوند
+  await acquireSignerLocks([master], { label: "launch master" });
 
   const tx = await lab.launchAndBuy(
     params,
@@ -208,10 +216,13 @@ async function main() {
     console.log("⛔ تراکنش لانچ ریورت شد (status=0) — رکورد با token=null می‌ماند");
   }
 
-  // استخراج آدرس توکن/کرو فقط از ایونت Launched — بدون حدس از logs[0] (حدس می‌تواند آدرس اشتباه ذخیره کند!)
+  // استخراج آدرس توکن/کرو فقط از ایونت Launched «روی خود قرارداد LaunchAndBuy» —
+  // ممیزی ۵: فیلتر log.address اجباری است؛ هر قرارداد دیگری در رسید نباید رکورد را آلوده کند
   let tokenAddr = null, curveAddr = null, tokensOut = null;
   const iface = lab.interface;
+  const labAddr = ADDR.LAUNCH_AND_BUY.toLowerCase();
   for (const log of rc.logs) {
+    if (log.address.toLowerCase() !== labAddr) continue; // فقط لاگ‌های خودِ LAB
     try {
       const parsed = iface.parseLog(log);
       if (parsed?.name === "Launched") {
@@ -221,7 +232,21 @@ async function main() {
       }
     } catch {}
   }
-  if (!tokenAddr) console.warn("⚠️ ایونت Launched پیدا نشد — token/curve در رکورد null است؛ از Blockscout دستی بخوان و در رکورد بنویس");
+  // ممیزی ۵: تأیید شدن تراکنش بدون ایونت Launched = رکورد ناقص حیاتی — نباید «موفق» دیده شود
+  if (rc.status === 1 && !tokenAddr) {
+    record.token = null;
+    record.curve = null;
+    record.state = "confirmed-no-event";
+    record.receiptStatus = rc.status;
+    record.blockNumber = rc.blockNumber;
+    record.confirmedAt = new Date().toISOString();
+    atomicWriteJson(file, record);
+    console.log(`⛔ تراکنش لانچ ماین شد ولی ایونت Launched روی قرارداد LAB دیده نشد! (rc.logs=${rc.logs.length})
+   هش: ${tx.hash} — رکورد به‌صورت «confirmed-no-event» ذخیره شد: ${file}
+   آدرس token/curve را با probe.js یا Blockscout پیدا و در رکورد بنویس. کد خروج: ۲`);
+    releaseSignerLocks();
+    process.exit(2);
+  }
 
   // به‌روزرسانی رکورد نهایی روی همان فایل
   record.token = tokenAddr ?? null;

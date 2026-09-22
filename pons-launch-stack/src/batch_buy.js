@@ -10,7 +10,7 @@ import fs from "node:fs";
 import { Contract, Interface, Wallet, id, isAddress, formatUnits } from "ethers";
 import { ADDR, CHAIN, LAUNCHES_DIR, env, parseArgs } from "./config.js";
 import { BONDING_CURVE_ABI, ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, weiOf, resolveBatchAllocation, nowTag, sleep, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock, assertContract } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, weiOf, resolveBatchAllocation, nowTag, sleep, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock, assertContract, acquireSignerLocks, releaseSignerLocks } from "./lib.js";
 import { panicSellAll, marketPrice, estMinOut } from "./market.js";
 
 const MIN_BUY_ETH = 0.0005;
@@ -112,7 +112,11 @@ async function resolveFromBlock(a, { quiet = false } = {}) {
       return Math.max(0, latest - 500);
     }
   }
-  if (a["from-block"]) return Number(a["from-block"]);
+  if (a["from-block"]) {
+    const fb = Number(a["from-block"]);
+    if (!Number.isInteger(fb) || fb < 0) { console.log(`⛔ --from-block باید عدد صحیح ≥ ۰ باشد: "${a["from-block"]}"`); process.exit(1); }
+    return fb;
+  }
   const latest = await provider.getBlockNumber();
   if (!quiet) console.warn(`⚠️ --launch-tx/--from-block داده نشده؛ اسکن از بلاک ${Math.max(0, latest - 500)} — داده‌های قدیمی‌تر دیده نمی‌شوند!`);
   return Math.max(0, latest - 500);
@@ -129,10 +133,9 @@ async function buildGraduationChecker(curveAddr) {
       if (res && res !== "0x") {
         console.log(`🎓 تشخیص گرجوئیشن از طریق تابع ${sig} (فعال)`);
         return async () => {
-          try {
-            const r = await provider.call({ to: curveAddr, data });
-            return { graduated: r !== "0x" && BigInt(r) !== 0n, how: sig };
-          } catch { return { graduated: false, how: sig }; }
+          // ممیزی ۵: خطای RPC نباید «به‌ساکت false» برگردد — بیرون throw می‌شود تا شمارنده‌ی fail-closed کار کند
+          const r = await provider.call({ to: curveAddr, data }).catch((e) => { throw new Error(`rpc-grad(${sig}): ${e.shortMessage ?? e.message}`); });
+          return { graduated: r !== "0x" && BigInt(r) !== 0n, how: sig };
         };
       }
     } catch { /* تابع وجود ندارد → کاندید بعدی */ }
@@ -140,14 +143,13 @@ async function buildGraduationChecker(curveAddr) {
   console.log("🎓 تابع view برای گرجوئیشن پیدا نشد → تشخیص heuristic از روی افت رزرو‌ی کرو");
   let prev = null;
   return async () => {
-    try {
-      const cur = await provider.getBalance(curveAddr);
-      let g = false;
-      if (prev !== null && prev >= weiOf(0.01) && cur <= prev / 10n) g = true;
-      const before = prev;
-      prev = cur;
-      return { graduated: g, how: `افت ~۹۰٪ رزرو (مهاجرت لیکوییدیتی) [${before ? fmt(BigInt(before)) : "?"}→${fmt(cur)}]` };
-    } catch { return { graduated: false, how: "balance" }; }
+    // خواندن رزرو هم در خطای RPC throw می‌شود (نه «graduated:false» خاموش)
+    const cur = await provider.getBalance(curveAddr).catch((e) => { throw new Error(`rpc-grad(balance): ${e.shortMessage ?? e.message}`); });
+    let g = false;
+    if (prev !== null && prev >= weiOf(0.01) && cur <= prev / 10n) g = true;
+    const before = prev;
+    prev = cur;
+    return { graduated: g, how: `افت ~۹۰٪ رزرو (مهاجرت لیکوییدیتی) [${before ? fmt(BigInt(before)) : "?"}→${fmt(cur)}]` };
   };
 }
 
@@ -234,9 +236,11 @@ async function main() {
   // پنیک: پیش‌فرض روشن (انجمن با سند و نیاز کاربر) — --no-panic خاموش می‌کند
   const panic = !truthy(a["no-panic"]);
   const checkEvery = Math.max(1, Number(a["check-every"] ?? 3));
+  if (!Number.isInteger(Number(a["check-every"] ?? 3)) || checkEvery > 60) { console.log("⛔ --check-every باید عدد صحیح بین ۱ و ۶۰ باشد"); process.exit(1); }
   const stopOnGrad = !truthy(a["ignore-graduation"]);
   const totalEth = watchOnly ? 0 : numOpt(a.total, 0, { min: 0.0001, max: 1000, name: "total" });
-  const totalWei = weiOf(totalEth);
+  // ممیزی ۵: مبلغ دقیق از رشته‌ی اصلی (نه از روی نمایش اعشاری Number — انحراف ۲wei گزارش‌شده رفع شد)
+  const totalWei = watchOnly ? 0n : weiOf(String(a.total ?? String(totalEth)));
   const slippageBps = numOpt(a["slippage-bps"], Number(env("SLIPPAGE_BPS", "800")), { min: 0, max: 5000, name: "slippage-bps" });
   const panicConcurrency = Math.min(20, Math.max(1, Number(a["panic-concurrency"] ?? 6)));
   const minShareEth = numOpt(a["min-share"], MIN_BUY_ETH, { min: 0.000001, name: "min-share" });
@@ -376,15 +380,16 @@ async function main() {
   // preflight: مقصدهای پول واقعاً قراردادند؟ (ممیزی ۴ — ارسال به EOA بدون کد = سوختن پول)
   await assertContract(a.curve, "باندینگ-کرو");
   await assertContract(a.token, "توکن");
-  acquireRunLock(LOCK_FILE, {
-    force: truthy(a.force), forceLivePid: truthy(a["force-live-pid"]),
-    globalKey: `pons-batch-${CHAIN.id}-${master.address}`, // لاک سراسری: رقابت بین دو نسخه‌ی پروژه روی یک مستر/چین
-  });
-  const REL = () => releaseRunLock(LOCK_FILE);
-  console.log("🔴 MAINNET — پول واقعی در جریان است (پیش از این، --dry-run را کامل دیده‌ای؟)");
-
+  // ممیزی ۵: payer کسی است که تراکنش می‌فرستد → لاک‌ها بر اساس «آدرسِ امضاکننده»، نه نام عملیات
   const payer = payerWallet(a);
   selfSet.add(payer.address.toLowerCase());
+  acquireRunLock(LOCK_FILE, {
+    force: truthy(a.force), forceLivePid: truthy(a["force-live-pid"]),
+    globalKey: `pons-batch-${CHAIN.id}-${payer.address}`, // لاک سراسری نسخه‌های پروژه
+  });
+  const REL = () => { releaseRunLock(LOCK_FILE); releaseSignerLocks(); };
+  await acquireSignerLocks([payer], { label: "batch-buy payer" }); // لاک nonce سطحِ امضاکننده
+  console.log("🔴 MAINNET — پول واقعی در جریان است (پیش از این، --dry-run را کامل دیده‌ای؟)");
   const minOutFlag = a["min-out"] !== undefined ? BigInt(a["min-out"]) : null;
   const allowZeroMinOut = truthy(a["allow-zero-minout"]) || minOutFlag === 0n;
   const perDelay = Number(a.delay ?? 100);
@@ -419,7 +424,7 @@ async function main() {
 
   // ─── نقشه‌ی تخصیص: resume = همان نقشه‌ی منجمد‌شده (هرگز دوباره تصادفی نمی‌شود) — منطق در lib به‌صورت تست‌شدنی ───
   let amountsWei;
-  const minShareWei = weiOf(minShareEth);
+  const minShareWei = a["min-share"] !== undefined ? weiOf(String(a["min-share"])) : weiOf(String(minShareEth)); // string-first (ممیزی ۵)
   let resolvedAlloc = null;
   try {
     // dry-run همان محدودیت min-share واقعی را می‌سنجد (dryRun:false برای allocation — parity کامل با اجرای واقعی)
@@ -469,6 +474,21 @@ async function main() {
       }
       else console.log(`   ⚠️ تراکنش قبلی ${r.tx} وضعیت «${st}» دارد ⇒ دوباره انجام می‌شود: ${r.recipient}`);
     }
+    // ۱.۵- رکوردهای «نیتِ قبل از broadcast» بدون هش (کرش دقیقاً بین ارسال و دریافت پاسخ RPC): با nonce تعیین‌تکلیف
+    for (const f of (journal.failed ?? []).filter((e) => !e.tx && Number.isInteger(e.nonce))) {
+      const countLatest = await provider.getTransactionCount(payer.address);
+      const countPending = await provider.getTransactionCount(payer.address, "pending");
+      if (countLatest > f.nonce) {
+        console.log(`⛔ رکورد نیتِ بدون هش (nonce=${f.nonce}، گیرنده ${f.recipient}): این nonce در زنجیره مصرف شده ⇒ تراکنشی ماین شده که هشش را نداریم —\n   رسید را از Blockscout ببین و دستی تکمیل کن. resend کاملاً ممنوع (fail-closed). اجرا متوقف شد.`);
+        REL(); process.exit(1);
+      }
+      if (countPending > countLatest && countPending > f.nonce) {
+        console.log(`⛔ رکورد نیتِ بدون هش (nonce=${f.nonce}): این nonce در mempool در حالت pending است ⇒ «شاید broadcast شده» — تعیین‌تکلیف دستی لازم (fail-closed، بدون resend). اجرا متوقف شد.`);
+        REL(); process.exit(1);
+      }
+      console.log(`   ↩︎ نیتِ بدون هش (nonce=${f.nonce}) هرگز مصرف نشده ⇒ امن برای انجام دوباره: ${f.recipient}`);
+    }
+    journal.failed = (journal.failed ?? []).filter((e) => e.intent ? !!e.tx : true); // نیت‌های بدون هشِ حل‌شده (یا مصرف‌نشده) دیگر مانع نیستند
     // ۲- شکست‌های دارای هش (شامل «در تعلیق»): ابتدا تعیین‌تکلیف، سپس تصمیم
     const keepFailed = [];
     for (const f of journal.failed ?? []) {
@@ -541,15 +561,30 @@ async function main() {
     const data = curveIface.encodeFunctionData("buy", [quoteIn, minOutFor(quoteIn), target]);
     await provider.call({ to: a.curve, data, value: quoteIn, from: payer.address });
     gp = await gasPrice();
-    const tx = await payer.sendTransaction({ to: a.curve, data, value: quoteIn, gasPrice: gp });
+    // ممیزی ۵ — نیتِ ارسال «قبل» از broadcast با nonce صریح در ژورنال قرار می‌گیرد:
+    // کرش دقیقاً بین broadcast و پاسخ RPC ⇒ رکورد «بدون هش ولی با nonce» می‌ماند
+    // و اجرای بعد با getTransactionCount(latest/pending) تعیین‌تکلیف می‌کند (هرگز resend کور).
+    const nonce = await payer.getNonce("pending");
+    journal.failed = (journal.failed ?? []).filter((e) => !(e.nonce === nonce && e.intent && e.status === "sending-intent"));
+    journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), nonce, payer: payer.address, status: "sending-intent", intent: true, at: new Date().toISOString() });
+    J();
+    let tx;
+    try {
+      tx = await payer.sendTransaction({ to: a.curve, data, value: quoteIn, gasPrice: gp, nonce });
+    } catch (sendErr) {
+      // ارسال ناموفق پیش از broadcast (ریورت/اتصال) ⇒ نیت پاک و خطا طبق روال بالا
+      journal.failed = journal.failed.filter((e) => !(e.nonce === nonce && e.intent));
+      J();
+      throw sendErr;
+    }
+    // بلافاصله بعد از broadcast: هش به رکوردِ «نیت» می‌چسبد
+    journal.failed = journal.failed.filter((e) => !(e.nonce === nonce && e.intent));
+    journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, nonce, payer: payer.address, status: "broadcast", intent: true, at: new Date().toISOString() });
+    J();
     return { tx, data };
   }
 
   async function waitAndRecord(target, quoteIn, tx) {
-    // ← ثبت «نیت» بلافاصله بعد از broadcast: اگر الان کرش کنیم، هشِ معلقِ ما در ژورنال است و resume تعیین‌تکلیفش می‌کند
-    journal.failed = (journal.failed ?? []).filter((e) => e.tx !== tx.hash);
-    journal.failed.push({ recipient: target, ethInWei: quoteIn.toString(), tx: tx.hash, nonce: tx.nonce, status: "broadcast", intent: true, at: new Date().toISOString() });
-    J();
     const dropIntent = () => { journal.failed = journal.failed.filter((e) => !(e.tx === tx.hash && e.intent)); };
     try {
       const rc = await tx.wait(1, 120000);

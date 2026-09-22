@@ -399,14 +399,145 @@ ok("numOpt int: '50' قبول", numOpt("50", 0, { int: true, name: "pct" }) === 
   const v3 = coder.encode(["bytes", "address", "uint256", "uint256"], ["0xaabbccddeeff", recip, 12345n, 999n]);
   const d1 = sellMod.decodeUrBlob(0x00, v3);
   ok("V3_SWAP_EXACT_IN دیکود درست", d1.name === "V3_SWAP_EXACT_IN" && d1.recipient.toLowerCase() === recip && d1.amountIn === "12345" && d1.amountOutMin === "999");
-  const v4 = coder.encode(["bytes", "bytes[]"], ["0x001122", ["0xaa", "0xbb", "0xcc"]]);
+  const v4 = coder.encode(["bytes", "bytes[]"], ["0x0c0e0f", ["0xaa", "0xbb", "0xcc"]]);
   const d2 = sellMod.decodeUrBlob(0x10, v4);
-  ok("V4_SWAP دیکود درست (اکشن‌ها/پارام‌ها)", d2.actionsBytes === 3 && d2.paramCount === 3);
+  ok("V4_SWAP دیکود درست (اکشن‌ها/پارام‌ها)", d2.actions.length === 3 && d2.paramsHex.length === 3 && d2.actionNames[0].includes("SETTLE_ALL"));
   ok("فرمان ناشناخته ⇒ null (بدون decode-check سخت‌گیرانه)", sellMod.decodeUrBlob(0x08, "0x1234") === null);
   let threw = false;
   try { sellMod.decodeUrBlob(0x00, "0x1234"); } catch { threw = true; } // بلوب خراب با فرمان شناخته ⇒ throw (ابطال در main)
   ok("بلوب نامعتبر با فرمان شناخته ⇒ خطا", threw);
   void ethers;
+}
+
+// ═══ بلوک ممیزی ۵ ═══
+
+// ─── ۳۰) CLI smoke: batch_buy/fund هیچ‌وقت با ReferenceError کرش نکنند (باگ «master is not defined») ───
+{
+  const { spawnSync } = await import("node:child_process");
+  const C = "0x00000000000000000000000000000000000000c1", T = "0x00000000000000000000000000000000000000a1", R = "0x00000000000000000000000000000000000000b1";
+  const r1 = spawnSync("node", ["src/batch_buy.js", "--curve", C, "--token", T, "--total", "0.0002", "--recipients", R, "--dry-run"], { cwd: ROOT, timeout: 60000 });
+  const out1 = String(r1.stderr) + String(r1.stdout);
+  ok("batch_buy CLI بدون ReferenceError از parse/setup عبور می‌کند", !/master is not defined|ReferenceError/.test(out1));
+  const r2 = spawnSync("node", ["src/fund.js", "fund", "--total", "0.0002", "--workers", "1"], { cwd: ROOT, timeout: 60000 });
+  const out2 = String(r2.stderr) + String(r2.stdout);
+  ok("fund CLI بدون ReferenceError اجرا می‌شود (گرای RPC هم در این‌جا مهم نیست)", !/master is not defined|ReferenceError/.test(out2));
+}
+
+// ─── ۳۱) splitWeiRandom الگوریتم جدید: ۱۰۰هزار حالتِ گوشه‌دار، اینواریانت‌های قطعی ───
+{
+  const { splitWeiRandom } = lib;
+  let bad = 0;
+  for (let t = 0; t < 100000 && bad < 3; t++) {
+    const n = 1 + Math.floor(Math.random() * 64);
+    let minShare, totalWei;
+    const mode = t % 4;
+    if (mode === 0) { minShare = BigInt(Math.floor(Math.random() * 1e15)); totalWei = minShare * BigInt(n) + BigInt(Math.floor(Math.random() * 3)); }
+    else if (mode === 1) { minShare = BigInt(Math.floor(Math.random() * 1000)); totalWei = minShare * BigInt(n) + BigInt(Math.floor(Math.random() * n + 1)); }
+    else if (mode === 2) { minShare = BigInt(Math.floor(Math.random() * 1e17)); totalWei = minShare * BigInt(n) + BigInt(Math.floor(Math.random() * 1e18)); }
+    else { minShare = 0n; totalWei = BigInt(Math.floor(Math.random() * n + 1)); }
+    try {
+      const s = splitWeiRandom(totalWei, n, minShare);
+      if (s.reduce((a, b) => a + b, 0n) !== totalWei || s.some((x) => x < minShare)) bad++;
+    } catch { bad++; }
+  }
+  ok("splitWeiRandom: ۱۰۰هزار حالت گوشه‌دار، همه Σ==total و همه≥min", bad === 0);
+  ok("total=n×min دقیق ⇒ همه min هستند", splitWeiRandom(1000n, 4, 250n).every((x) => x === 250n));
+  ok("n=1 همه‌ی total را می‌گیرد", splitWeiRandom(777n, 1, 100n)[0] === 777n);
+  let threw = false;
+  try { splitWeiRandom(99n, 2, 50n); } catch { threw = true; }
+  ok("total < n×min ⇒ ابطال", threw);
+}
+
+// ─── ۳۲) اعتبارسنجی نقشه‌ی تخصیص منجمد (ژورنال دست‌کاری‌شده) ───
+{
+  const { resolveBatchAllocation } = lib;
+  const recips = ["0x00000000000000000000000000000000000000a1", "0x00000000000000000000000000000000000000a2"];
+  const base = { results: [{ tx: "0x1" }], alloc: { recipients: recips, amountsWei: ["1500", "500"] } };
+  const cases = [
+    ["منفی", { ...base, alloc: { recipients: recips, amountsWei: ["-5", "505"] } }, "alloc-negative"],
+    ["طول", { ...base, alloc: { recipients: recips, amountsWei: ["1500"] } }, "alloc-length-mismatch"],
+    ["هرزنامه", { ...base, alloc: { recipients: recips, amountsWei: ["x", "500"] } }, "alloc-corrupt"],
+    ["جمع‌صفر", { ...base, alloc: { recipients: recips, amountsWei: ["0", "0"] } }, "alloc-zero-total"],
+  ];
+  let all = true;
+  for (const [name, j, want] of cases) {
+    const r = resolveBatchAllocation({ journal: j, fresh: false, recipients: recips, totalWei: 2000n, minShareWei: 0n });
+    if (r.ok || r.reason !== want) { all = false; console.log(`  (پنشد: ${name}: ${JSON.stringify(r)})`); }
+  }
+  ok("alloc فریزِ خراب/منفی/کوتاه/صفر ⇒ fail-closed", all);
+  const okF = resolveBatchAllocation({ journal: base, fresh: false, recipients: recips, totalWei: 2000n, minShareWei: 0n });
+  ok("alloc فریز سالم قبول می‌شود", okF.ok && okF.source === "frozen" && okF.amountsWei[0] === 1500n);
+}
+
+// ─── ۳۳) UR decoders هر دو نسخه (legacy ۴فیلدی × v2 ۶فیلدی) + اعتبارسنجی بلوب V4 ───
+{
+  const { AbiCoder, ethers } = await import("ethers");
+  const sellMod = await import("../src/sell.js");
+  const coder = AbiCoder.defaultAbiCoder();
+  const recip = "0x0000000000000000000000000000000000000bee";
+  // legacy: (bytes path, address recipient, uint256 amountIn, uint256 amountOutMin)
+  const legacyBlob = coder.encode(["bytes", "address", "uint256", "uint256"], ["0xaabbcc", recip, 777n, 5n]);
+  const d1 = sellMod.decodeUrBlob(0x00, legacyBlob, "legacy");
+  ok("legacy V3 دیکود درست", d1.recipient.toLowerCase() === recip && d1.amountIn === "777" && d1.amountOutMin === "5");
+  // v2: (address recipient, uint256 amountIn, uint256 amountOutMin, bytes path, bool payerIsUser, uint256[] minHop)
+  const v2Blob = coder.encode(["address", "uint256", "uint256", "bytes", "bool", "uint256[]"], [recip, 777n, 5n, "0xddeeff", true, [1n, 2n]]);
+  const d2 = sellMod.decodeUrBlob(0x00, v2Blob, "v2");
+  ok("v2 V3 دیکود درست (فرمت recipient-اول رسمی)", d2.recipient.toLowerCase() === recip && d2.amountIn === "777" && d2.payerIsUser === true && d2.pathBytes === 3);
+  // تشخیص اشتباه-تطبیق: بلوب v2 با فرمت legacy دیکود شود ⇒ باید throw کند (نه خروجی اشتباه)
+  let threw3 = false;
+  try { sellMod.decodeUrBlob(0x00, v2Blob, "legacy"); } catch { threw3 = true; }
+  ok("بلوب v2 با فرمت legacy قابل‌دیکود نیست (خطا، نه نتیجه‌ی غلط)", threw3);
+  // V4 با اکشن‌های SETTLE_ALL + SWAP_EXACT_IN + TAKE_ALL
+  const token = "0x0000000000000000000000000000000000000aaa", weth = "0x0000000000000000000000000000000000000bbb";
+  const p1 = coder.encode(["address", "uint256"], [token, 1000n]);
+  const p2 = coder.encode(["uint256"], [999n]);
+  const p3 = coder.encode(["address", "uint256"], [weth, 42n]);
+  const v4blob = coder.encode(["bytes", "bytes[]"], ["0x0c070f", [p1, p2, p3]]);
+  const d4 = sellMod.decodeUrBlob(0x10, v4blob, "v2");
+  ok("V4 اکشن‌ها دیکود می‌شوند", d4.actionNames.join(",").includes("SETTLE_ALL") && d4.actionNames.join(",").includes("TAKE_ALL"));
+  const vOk = sellMod.validateV4Blob(d4, { token, weth, expectedInWei: "1000" });
+  ok("validateV4Blob سالم قبول", vOk.ok === true);
+  const vBad = sellMod.validateV4Blob(d4, { token, weth, expectedInWei: "1001" });
+  ok("validateV4Blob ناهماهنگی مبلغ را رد می‌کند", vBad.ok === false && vBad.problems.some((p) => p.includes("نمی‌خواند")));
+  const vW = sellMod.validateV4Blob(d4, { token: weth, weth: token, expectedInWei: null });
+  ok("validateV4Blob currency ناش/جهت وارونه را رد می‌کند", vW.ok === false);
+  void ethers;
+}
+
+// ─── ۳۴) آدرس‌های config از کانال ممیزی ۵ — همه چک‌س‌م/فرمت معتبر ───
+{
+  const { getAddress } = await import("ethers");
+  const { ADDR } = await import("../src/config.js");
+  ok("POOL_MANAGER رسمی lowercase معتبر", ADDR.POOL_MANAGER === "0x8366a39cc670b4001a1121b8f6a443a643e40951" && getAddress(ADDR.POOL_MANAGER) !== null);
+  ok("WETH رسمی Robinhood معتبر", ADDR.WETH.toLowerCase() === "0x0bd7d308f8e1639fab988df18a8011f41eacad73" && getAddress(ADDR.WETH) !== null);
+  ok("PERMIT2 معتبر", getAddress(ADDR.PERMIT2) !== null);
+  ok("UNIVERSAL_ROUTER معتبر", getAddress(ADDR.UNIVERSAL_ROUTER) !== null);
+  ok("همه‌ی آدرس‌ها عجیب نیستند", ADDR.PERMIT2 === "0x000000000022d473030f116ddee9f6b43ac78ba3");
+}
+
+// ─── ۳۵) گارد گرجوئیشن fail-closed واقعی: checker داخلی در خطای RPC باید throw کند (نه graduated:false) ───
+{
+  // main در batch_buy بدون گارد اجرا می‌شود — هرگز import نکن؛ متن را اسکن می‌کنیم
+  const srcTxt = fs.readFileSync(`${ROOT}/src/batch_buy.js`, "utf8");
+  ok("guard/grad: catch داخلی به graduated:false خاموش برنگردد", !/catch \{\s*return \{ graduated: false/.test(srcTxt));
+  ok("buildGraduationChecker خطای RPC را throw می‌کند", /rpc-grad/.test(srcTxt));
+}
+
+// ─── ۳۶) 스테ال-لاک: رقابت lock سراسری — پردازش بازنده نباید لاک محلی نامشروع بگذارد ───
+{
+  const { spawn, spawnSync } = await import("node:child_process");
+  const gk = `pons-testlock-stale-${process.pid}`;
+  fs.mkdirSync(`${os.tmpdir()}/projC`, { recursive: true }); fs.mkdirSync(`${os.tmpdir()}/projD`, { recursive: true });
+  const lkC = `${os.tmpdir()}/projC/lk_${process.pid}.json`;
+  const lkD = `${os.tmpdir()}/projD/lk_${process.pid}.json`;
+  const scriptC = `import { acquireRunLock } from "${ROOT}/src/lib.js"; acquireRunLock("${lkC}", { globalKey: "${gk}" }); console.log("GRABBED"); setTimeout(()=>process.exit(0), 900); setInterval(()=>{}, 500);`;
+  const c = spawn("node", ["--input-type=module", "-e", scriptC]);
+  await new Promise((res) => { c.stdout.on("data", (d) => String(d).includes("GRABBED") && res()); });
+  const d = spawnSync("node", ["--input-type=module", "-e", `import { acquireRunLock } from "${ROOT}/src/lib.js"; acquireRunLock("${lkD}", { globalKey: "${gk}" }); console.log("D GOT IT");`], { timeout: 30000 });
+  ok("رقیب سراسری رد شد", d.status !== 0 && !String(d.stdout).includes("D GOT IT"));
+  ok("پردازش بازنده هیچ لاک محلی‌ای روی دیسک نگذاشت (stale-lock رفع شد)", !fs.existsSync(lkD));
+  await new Promise((res) => c.on("exit", res));
+  fs.rmSync(lkC, { force: true }); fs.rmSync(lkD, { force: true }); fs.rmSync(`${os.homedir()}/.pons-launch-stack-locks/${gk}.lock`, { force: true });
 }
 
 console.log(`\n————— نتیجه: ${pass} PASS، ${fail} FAIL —————`);

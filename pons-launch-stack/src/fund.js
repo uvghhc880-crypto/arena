@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import { Wallet, isAddress } from "ethers";
 import { WALLETS_OUT, CHAIN, env, parseArgs } from "./config.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, legacyHd, eth, fmt, gasPrice, weiOf, resolveBatchAllocation, sleep, nowTag, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, legacyHd, eth, fmt, gasPrice, weiOf, resolveBatchAllocation, sleep, nowTag, atomicWriteJson, readJsonSafe, classifyTx, acquireRunLock, releaseRunLock, acquireSignerLocks, releaseSignerLocks } from "./lib.js";
 
 const FUND_JOURNAL = `${WALLETS_OUT}/fund_journal.json`;
 const FUND_LOCK = `${WALLETS_OUT}/fund.lock`;
@@ -53,15 +53,23 @@ async function main() {
 
   if (cmd === "fund") {
     // شارژ گس کارگرها — خرید باندل کار batch_buy/payer است، این‌جا فقط گس (~0.06 مجموعاً) کافی است
-    const total = Number(a.total ?? "0.06");
-    if (!Number.isFinite(total) || total <= 0) { console.log("⛔ --total نامعتبر است"); process.exit(1); }
+    // ممیزی ۵: --total به‌صورت رشته و string-first عبور می‌کند (بدون ضرر دقت Number)
+    const totalStr = String(a.total ?? "0.06").trim();
+    if (!/^\d+(\.\d{1,18})?$/.test(totalStr)) { console.log(`⛔ --total نامعتبر (عدد اعشاری مثبت، حداکثر ۱۸ رقم اعشار): "${a.total}"`); process.exit(1); }
+    const totalWei = weiOf(totalStr);
+    if (totalWei <= 0n) { console.log("⛔ --total باید بزرگ‌تر از صفر باشد"); process.exit(1); }
     // ⚠️ باگ ممیزی ۳ بود: --legacy-hd اینجا از chakra به deriveWorkers نمی‌رسید و پول به ولت‌های BIP44 جدید می‌رفت
     const workers = deriveWorkers(Number(a.workers ?? env("WORKER_COUNT", "28")), workerStart(a), { legacy });
     if (legacy) console.log("🕰️ --legacy-hd فعال: ولت‌های مقصد = مسیر قدیمی اشتباه (فقط بازیابی لانچ‌های پیشین)");
-    const totalWei = weiOf(total);
     const minShareWei = a["min-share"] ? weiOf(String(a["min-share"])) : 0n;
     const master = masterWallet();
-    const force = truthy(a.force);
+    const force = truthy(a.force);   // ← فقط برای لاک (بازیابی PID مرده) — به‌صلاحیت ارسال تکراری نیست (ممیزی ۵)
+    const resend = truthy(a.resend); // ← ارسال دوباره برای ولت‌های دارای رکورد تأییدشده — صریح و جدا
+    if (force && !truthy(a["force-live-pid"])) console.log("ℹ️ --force فقط لاک مرده را کنار می‌زند — برای ارسالِ دوباره از --resend استفاده کن");
+
+    // ممیزی ۵: لاک «قبل» از خواندن/تغییر ژورنال — دو اجرای هم‌زمان دیگر ژورنال را بازنویسی نمی‌کنند
+    acquireRunLock(FUND_LOCK, { force, forceLivePid: truthy(a["force-live-pid"]), globalKey: `pons-fund-${CHAIN.id}-${master.address}` });
+    await acquireSignerLocks([master], { label: "fund master" }); // لاک nonce سطح امضاکننده
 
     const journal = loadJournal();
     if (journal.meta && !journal.meta.chainId) journal.meta.chainId = CHAIN.id;
@@ -102,20 +110,32 @@ async function main() {
       }
     }
 
-    console.log(`💸 شارژ گس ${workers.length} ولت با مجموع ${total} ETH از مستر${force ? " (--force: شارژ دوباره‌ی ژورنال‌شده‌ها)" : ""}`);
+    if (resend) console.warn("⚠️ --resend: ولت‌های دارای رکورد تأییدشده هم دوباره ارسال می‌شوند (ارسال تکراری واقعی)");
+    console.log(`💸 شارژ گس ${workers.length} ولت با مجموع ${totalStr} ETH از مستر`);
     const bal = await provider.getBalance(master.address);
     if (bal < totalWei + eth(0.005)) {
-      console.log(`⛔ موجودی مستر کافی نیست: ${fmt(bal)} ETH < ${total + 0.005} ETH`);
+      console.log(`⛔ موجودی مستر کافی نیست: ${fmt(bal)} ETH < ${Number(totalStr) + 0.005} ETH`);
       process.exit(1);
     }
-    // run-lock: دو فرایند fund هم‌زمان ممنوع — محلی (این پوشه) + سراسری (هر نسخه‌ی پروژه روی همین مستر/چین)
-    acquireRunLock(FUND_LOCK, { force, forceLivePid: truthy(a["force-live-pid"]), globalKey: `pons-fund-${CHAIN.id}-${master.address}` });
 
     let okCount = 0, skipCount = 0, failCount = 0;
     for (let i = 0; i < workers.length; i++) {
       const w = workers[i];
       const entry = journal.entries[w.address];
-      if (entry && !force) {
+      if (entry && !resend) {
+        // تعیین‌تکلیف «نیتِ بدون هش» (کرش دقیقاً بین ارسال و پاسخ RPC): با nonce داوری می‌شود، هرگز resend کور نه
+        if (entry.state === "sending-intent" && Number.isInteger(entry.nonce)) {
+          const countLatest = await provider.getTransactionCount(master.address);
+          const countPending = await provider.getTransactionCount(master.address, "pending");
+          if (countLatest > entry.nonce || (countPending > countLatest && countPending > entry.nonce)) {
+            console.log(`   ⛔ ${w.address}: نیتِ بدون هش با nonce=${entry.nonce} «مصرف/در حال تعلیق» است — تعیین‌تکلیف دستی لازم؛ resend ممنوع (fail-closed)`);
+            failCount++;
+            continue;
+          }
+          console.log(`   ↩︎ ${w.address}: نیتِ بدون هش (nonce=${entry.nonce}) هرگز مصرف نشده ⇒ امن برای انجام دوباره`);
+          journal.entries[w.address] = { ...entry, state: "intent-unconsumed" };
+          saveJournal(journal);
+        }
         // وریفای آنچین: وضعیت واقعی مرجع است نه متن ژورنال
         let st = entry.tx ? await classifyTx(entry.tx, { polls: 1 }) : "absent";
         if (st === "pending" || st === "unknown") {
@@ -148,9 +168,20 @@ async function main() {
       const value = amountsWei[i];
       const gp = await gasPrice();
       try {
-        const tx = await master.sendTransaction({ to: w.address, value, gasPrice: gp });
-        // ← ثبت «نیت» بلافاصله بعد از broadcast: کرش اینجا رسید نمی‌سازد ولی هش در ژورنال است
-        journal.entries[w.address] = { valueWei: value.toString(), tx: tx.hash, nonce: tx.nonce, at: new Date().toISOString(), state: "broadcast" };
+        // ممیزی ۵ — نیتِ ارسال «قبل» از broadcast با nonce صریح: کرش بین broadcast و پاسخ RPC ⇒ رکورد بدون هش ولی با nonce می‌ماند
+        const nonce = await master.getNonce("pending");
+        journal.entries[w.address] = { valueWei: value.toString(), nonce, at: new Date().toISOString(), state: "sending-intent" };
+        saveJournal(journal);
+        let tx;
+        try {
+          tx = await master.sendTransaction({ to: w.address, value, gasPrice: gp, nonce });
+        } catch (sendErr) {
+          journal.entries[w.address] = { valueWei: value.toString(), nonce, at: new Date().toISOString(), state: "failed-send", error: (sendErr.shortMessage ?? sendErr.message).slice(0, 100) };
+          saveJournal(journal);
+          throw sendErr;
+        }
+        // ← ثبت هش بلافاصله بعد از broadcast
+        journal.entries[w.address] = { valueWei: value.toString(), tx: tx.hash, nonce, at: new Date().toISOString(), state: "broadcast" };
         saveJournal(journal);
         try {
           await tx.wait(1, 120000);
@@ -177,6 +208,7 @@ async function main() {
     }
     console.log(`\n✔️ پایان شارژ: ${okCount} ارسال، ${skipCount} رد (قبلاً شارژ)، ${failCount} ناموفق/نامعلوم — ژورنال: ${FUND_JOURNAL}`);
     releaseRunLock(FUND_LOCK);
+    releaseSignerLocks();
     process.exitCode = failCount > 0 ? 1 : 0;
     return;
   }

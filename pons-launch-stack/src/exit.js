@@ -12,7 +12,7 @@
 import { Contract, Wallet } from "ethers";
 import { WALLETS_OUT, CHAIN, env, parseArgs } from "./config.js";
 import { ERC20_ABI } from "./abis.js";
-import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep, uniqueSigners, legacyHd, atomicWriteJson, readJsonSafe, assertContract } from "./lib.js";
+import { provider, masterWallet, deriveWorkers, workerStart, truthy, numOpt, fmt, gasPrice, sleep, uniqueSigners, legacyHd, atomicWriteJson, readJsonSafe, assertContract, acquireSignerLocks, releaseSignerLocks } from "./lib.js";
 import { curveTrades, panicSellAll, median, marketPrice } from "./market.js";
 
 // ─── فرمول سود (اصلاح‌شده‌ی ممیزی ۲): بازده کل = (عایدی فروش‌های قبلی + ارزش خالص فعلی) نسبت به کل خرید ───
@@ -40,7 +40,11 @@ async function resolveFromBlock(a) {
       return Math.max(0, latest - 500);
     }
   }
-  if (a["from-block"]) return Number(a["from-block"]);
+  if (a["from-block"]) {
+    const fb = Number(a["from-block"]);
+    if (!Number.isInteger(fb) || fb < 0) { console.log(`⛔ --from-block باید عدد صحیح ≥ ۰ باشد: "${a["from-block"]}"`); process.exit(1); }
+    return fb;
+  }
   const latest = await provider.getBlockNumber();
   console.warn(`⚠️ --launch-tx/--from-block داده نشده؛ اسکن از بلاک ${Math.max(0, latest - 500)} — سرمایه‌ی قدیمی‌تر شمرده نمی‌شود!`);
   return Math.max(0, latest - 500);
@@ -133,6 +137,9 @@ async function main() {
     if ((drainPrev.curve ?? "").toLowerCase() === a.curve.toLowerCase() && (drainPrev.token ?? "").toLowerCase() === a.token.toLowerCase()) {
       exiting = true;
       console.log(`♻️ resume «حالت تخلیه» از ژورنال پایدار: ${DRAIN_FILE} (تلاش‌های قبلی: ${panicAttempts}${drainPrev.status === "budget-exhausted" ? " — بودجه‌ی قبلی تمام شده بود؛ برای تلاش بیشتر --panic-max-attempts بزرگ‌تر بده" : ""})`);
+      // لاک امضاکننده‌ها برای ادامه‌ی تخلیه
+      try { await acquireSignerLocks(signers, { label: "exit drain resume", retryMs: 30000 }); }
+      catch (e) { console.warn(`⚠️ لاک برخی امضاکننده‌ها گرفته نشد (${(e.shortMessage ?? e.message).slice(0, 60)}) — ادامه با هشدار`); }
     } else {
       console.warn(`⚠️ ژورنال تخلیه‌ی دیگری روی دیسک است (${drainPrev.curve}/${drainPrev.token}) که با این اجرا یکی نیست — نادیده گرفته شد.`);
     }
@@ -167,6 +174,7 @@ async function main() {
         if (holders.length === 0) {
           console.log("\n✅ تخلیه‌ی کامل تأیید شد (موجودی توکن همه‌ی امضاکنندگان صفر است — همه‌ی خواندن‌ها موفق).");
           saveDrain("complete");
+          releaseSignerLocks();
           return;
         }
         panicAttempts++;
@@ -249,6 +257,12 @@ async function main() {
 
       if (profitPct >= minProfitPct) {
         console.log(`\n🎯 هدف رسید: سود خالص پس از ایمپکت = ${profitPct === Infinity ? "∞" : profitPct.toFixed(0) + "٪"} ≥ ${minProfitPct}٪ — خروج موازی کامل الان!\n`);
+        // ممیزی ۵: ژورنال تخلیه «پیش از اولین فروشِ واقعی» نوشته می‌شود — پنجره‌ی کرس بین اولین تراکنش و ثبت حالت از بین رفت
+        exiting = true;
+        saveDrain("draining", { phase: "initial-panic", triggerProfitPct: Number(profitPct.toFixed(2)) });
+        // لاک سراسری امضاکننده‌ها قبل از ارسال‌های فروش (nonce سطح امضاکننده) — با صبر کوتاه تا آزادی
+        try { await acquireSignerLocks(signers, { label: "exit panic/drain", retryMs: 30000 }); }
+        catch (e) { console.warn(`⚠️ گرفتن همه‌ی لاک‌های امضاکننده ممکن نشد (${(e.shortMessage ?? e.message).slice(0, 70)}) — خروج با هشدار ادامه می‌یابد (تداخل nonce با فرایند دیگر را خودِ RPC مدیریت می‌کند)`); }
         let before = 0n;
         for (const s of signers) { try { before += await provider.getBalance(s.address); } catch {} }
         const gp = await gasPrice();
@@ -260,15 +274,20 @@ async function main() {
         let after = 0n;
         for (const s of signers) { try { after += await provider.getBalance(s.address); } catch {} }
         const received = Number(fmt(after - before));
-        if (pres.fail > 0) {
-          // شروع حالت تخلیه: از این نقطه شرط سود دیگر تنظیم‌کننده نیست و ولت‌های دارای توکن تا پایان جنگیده می‌شوند
-          exiting = true;
-          saveDrain("draining", { triggerProfitPct: Number(profitPct.toFixed(2)) }); // پایدار — کرش این‌جا تخلیه را متوقف نمی‌کند
-          console.log(`⚠️ خروج «ناقص» بود: ${pres.fail} ولت ناموفق — حالت تخلیه فعال شد؛ رصد/تخلیه بدون شرط سود ادامه دارد… (ژورنال تخلیه: ${DRAIN_FILE})`);
+        // ممیزی ۵: «موفقیت فروش» فقط با اثباتِ آنچین صفرشدن موجودی توکن — نه pres.fail===0 به‌تنهایی
+        let leftBal = 0n, leftErr = 0; const leftHolders = [];
+        for (const s of signers) {
+          try { const b = await token.balanceOf(s.address); if (b > 0n) { leftBal += b; leftHolders.push(s.address); } } catch { leftErr++; }
+        }
+        if (pres.fail > 0 || leftHolders.length > 0 || leftErr > 0) {
+          console.log(`⚠️ خروج «ناقص» است (ولت‌های ناموفق: ${pres.fail}، دارای موجودی: ${leftHolders.length}، خطای خواندن: ${leftErr}) — رصد/تخلیه بدون شرط سود ادامه دارد… (ژورنال تخلیه: ${DRAIN_FILE})`);
+          saveDrain("draining", { phase: "drain-loop", holders: leftHolders });
           continue;
         }
         console.log(`💵 بازده کل واقعی پس از خروج (عایدی قبلی + دلتای این خروج): ${(proceedsEth + received).toFixed(4)} ETH${spentEth > 0 ? ` = ${((proceedsEth + received) / spentEth).toFixed(2)}× سرمایه (سود واقعی ${(((proceedsEth + received) / spentEth - 1) * 100).toFixed(0)}٪)` : ""}`);
         if (spentEth > 0 && (proceedsEth + received) / spentEth < neededMult) console.log(`⚠️ پرشدنی واقعی زیر مدل آمد (${((proceedsEth + received) / spentEth).toFixed(2)} < ${neededMult.toFixed(2)}) — تخفیف/فی را محافظه‌کارتر کن`);
+        saveDrain("complete", { phase: "initial-panic" });
+        releaseSignerLocks();
         return;
       }
     } catch (e) {

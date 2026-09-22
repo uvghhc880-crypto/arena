@@ -59,14 +59,15 @@ export const ADDR = {
   LAUNCH_AND_BUY: "0xe33e9e479df8802cb0866d5d05258bec4cf62948",
   // اسکروی فی کریتور — claim از اینجاست
   FEE_ESCROW: "0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e",
-  // یونیورسال روتر (برای فروش روی مارکت‌های V3/V4)
-  UNIVERSAL_ROUTER: "0x8876789976decbfcbbbe364623c63652db8c0904",
-  // V4 PoolManager (مقصد نقدینگی بعد از گرجوئیشن)
-  POOL_MANAGER: "0x8366a39CC670B4001A1121B8F6A443a643e40951",
+  // یونیورسال روتر (برای فروش روی مارکت‌های V3/V4) — deployments رسمی uniswap/contracts، فایل 4663.md
+  // نسخه‌ی قدیمی‌تر: 0x8876789976decbfcbbbe364623c63652db8c0904 | نسخه‌ی v2.1.2 (فرمت calldata جدید): 0x204FAca1764B154221e35c0d20aBb3c525710498
+  UNIVERSAL_ROUTER: env("UNIVERSAL_ROUTER_ADDRESS", "0x8876789976decbfcbbbe364623c63652db8c0904"),
+  // V4 PoolManager (مقصد نقدینگی بعد از گرجوئیشن) — checksum فرمت رسمی (حروف کوچک)
+  POOL_MANAGER: env("POOL_MANAGER_ADDRESS", "0x8366a39cc670b4001a1121b8f6a443a643e40951"),
   // Permit2 یونیسواپ (استاندارد)
-  PERMIT2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
-  // WETH زنجیره (مسیر سوآپ‌های مشاهده‌شده)
-  WETH: env("WETH_ADDRESS", "0xbd7d308f8e1639fab988df18a8011f41eacad730"),
+  PERMIT2: "0x000000000022d473030f116ddee9f6b43ac78ba3",
+  // WETH رسمی Robinhood Chain (docs.robinhood.com/chain/contracts)
+  WETH: env("WETH_ADDRESS", "0x0bd7d308f8e1639fab988df18a8011f41eacad73"),
   // فکتوری اصلی V2 (خواندنی: launchFee/canLaunch/getLaunchConfig)
   LAUNCH_FACTORY_V2: "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
   // کانترکت کمکی بچ‌بای فارم واقعی (صرفاً مرجع/رصد — لازمش نداریم؛ کرو recipient می‌گیرد)

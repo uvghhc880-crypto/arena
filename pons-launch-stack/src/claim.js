@@ -18,7 +18,7 @@ async function claimOnce(signer, label = "", { doClaim = true } = {}) {
   if (!doClaim || bal === 0n) return BigInt(0);
   // توجه: escrow دو اورلود claim دارد (claim/claim(amount)) — باید صریح انتخاب شود
   const tx = await escrow.getFunction("claim()")();
-  await tx.wait();
+  await tx.wait(1, 120000); // ممیزی ۵: wait بدون timeout = گیرکردن لایتناهی
   console.log(`✅ کلیم ${fmt(bal)} ETH به ${signer.address}: ${tx.hash}`);
   return bal; // مقدار کلیم‌شده (برای sweep «فقط دلتای کلیم»)
 }
@@ -37,12 +37,9 @@ async function main() {
   // preflight: FeeEscrow قرارداد است؟ (ممیزی ۴)
   await assertContract(ADDR.FEE_ESCROW, "FeeEscrow");
 
-  // لاک اجرا برای حالت watcher — دو فرایند کلیم هم‌زمان ممنوع
-  let locked = false;
-  if (watch) {
-    acquireRunLock(`${WALLETS_OUT}/claim.lock`, { globalKey: `pons-claim-${claimerWallet().address}` });
-    locked = true;
-  }
+  // لاک اجرا — ممیزی ۵: watcher «و» اجرای تک‌بار هر دو (دو فرایند کلیم هم‌زمان ممنوع)
+  acquireRunLock(`${WALLETS_OUT}/claim.lock`, { globalKey: `pons-claim-${claimerWallet().address}` });
+  const locked = true;
 
   const claimer = claimerWallet();
   console.log("کلیمر (ولت فی‌رسپینت):", claimer.address);

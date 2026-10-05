@@ -1,0 +1,165 @@
+{
+  "_comment": "═══════════════════════════════════════════════════════════════════════",
+  "_comment2": "  سرور خارجی (Exit Node) — خروجی چندکشوری",
+  "_comment3": "  مسیر: /usr/local/etc/xray/config.json",
+  "_comment4": "  پیش‌نیاز: اجرای wg-multipath.py که اینترفیس‌های wg0/wg1/wg2 را بالا می‌آورد",
+  "_comment5": "═══════════════════════════════════════════════════════════════════════",
+  "_how_it_works": "این سرور از سرور ایران ترافیک می‌گیرد. هر inbound یک کشور است. قانون routing آن inbound را به outbound همان کشور می‌فرستد، و آن outbound با sockopt.mark ترافیک را روی اینترفیس WireGuard آن کشور می‌فرستد. سایت مقصد، IP آن کشور را می‌بیند.",
+  "_mark_values": "mark ها باید با خروجی wg-multipath.py یکی باشند. پیش‌فرض: 1000، 1001، 1002 ...",
+
+  "log": {
+    "loglevel": "warning",
+    "error": "/var/log/xray/error.log"
+  },
+
+  "inbounds": [
+    {
+      "_note": "ورودی از سرور ایران → خروجی آلمان",
+      "tag": "from-iran-de",
+      "listen": "0.0.0.0",
+      "port": 10443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "email": "relay-de", "flow": "xtls-rprx-vision", "level": 0 }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "www.samsung.com:443",
+          "xver": 0,
+          "serverNames": ["www.samsung.com"],
+          "privateKey": "REPLACE_WITH_FOREIGN_PRIVATE_KEY",
+          "shortIds": ["a1b2c3d4e5f60718"]
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    },
+
+    {
+      "_note": "ورودی از سرور ایران → خروجی هلند",
+      "tag": "from-iran-nl",
+      "listen": "0.0.0.0",
+      "port": 18443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "email": "relay-nl", "flow": "xtls-rprx-vision", "level": 0 }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "www.samsung.com:443",
+          "xver": 0,
+          "serverNames": ["www.samsung.com"],
+          "privateKey": "REPLACE_WITH_FOREIGN_PRIVATE_KEY",
+          "shortIds": ["a1b2c3d4e5f60718"]
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    },
+
+    {
+      "_note": "ورودی از سرور ایران → خروجی آمریکا",
+      "tag": "from-iran-us",
+      "listen": "0.0.0.0",
+      "port": 20443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "cccccccc-cccc-cccc-cccc-cccccccccccc", "email": "relay-us", "flow": "xtls-rprx-vision", "level": 0 }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "www.samsung.com:443",
+          "xver": 0,
+          "serverNames": ["www.samsung.com"],
+          "privateKey": "REPLACE_WITH_FOREIGN_PRIVATE_KEY",
+          "shortIds": ["a1b2c3d4e5f60718"]
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    }
+  ],
+
+  "outbounds": [
+    {
+      "_note": "🇩🇪 خروجی آلمان — ترافیک روی wg0 علامت می‌خورد",
+      "tag": "wg-de",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIP" },
+      "streamSettings": {
+        "sockopt": { "mark": 1000 }
+      }
+    },
+    {
+      "_note": "🇳🇱 خروجی هلند — ترافیک روی wg1 علامت می‌خورد",
+      "tag": "wg-nl",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIP" },
+      "streamSettings": {
+        "sockopt": { "mark": 1001 }
+      }
+    },
+    {
+      "_note": "🇺🇸 خروجی آمریکا — ترافیک روی wg2 علامت می‌خورد",
+      "tag": "wg-us",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIP" },
+      "streamSettings": {
+        "sockopt": { "mark": 1002 }
+      }
+    },
+
+    { "_note": "🇩🇪 خروجی DNS آلمان", "tag": "dns-de", "protocol": "dns", "settings": { "address": "1.1.1.1", "port": 53, "nonIPQuery": "drop" }, "streamSettings": { "sockopt": { "mark": 1000 } } },
+    { "_note": "🇳🇱 خروجی DNS هلند", "tag": "dns-nl", "protocol": "dns", "settings": { "address": "1.1.1.1", "port": 53, "nonIPQuery": "drop" }, "streamSettings": { "sockopt": { "mark": 1001 } } },
+    { "_note": "🇺🇸 خروجی DNS آمریکا", "tag": "dns-us", "protocol": "dns", "settings": { "address": "1.1.1.1", "port": 53, "nonIPQuery": "drop" }, "streamSettings": { "sockopt": { "mark": 1002 } } },
+
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "blocked", "protocol": "blackhole", "settings": { "response": { "type": "http" } } }
+  ],
+
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "_note": "⛔ محافظت از حلقه: هرگز ترافیک خصوصی/محلی را به تونل نفرست",
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "blocked"
+      },
+      {
+        "_note": "⛔ ترافیک WireGuard خودمان (پورت ۵۱۸۲۰ و مانند آن) مستقیم برود",
+        "type": "field",
+        "port": "51820,1337",
+        "network": "udp",
+        "outboundTag": "direct"
+      },
+
+      { "_note": "🔀 نگاشت inbound → کشور", "type": "field", "inboundTag": ["from-iran-de"], "outboundTag": "wg-de" },
+      { "type": "field", "inboundTag": ["from-iran-nl"], "outboundTag": "wg-nl" },
+      { "type": "field", "inboundTag": ["from-iran-us"], "outboundTag": "wg-us" },
+
+      { "_note": "DNS هر کشور از همان تونل برود (جلوگیری از نشتی)", "type": "field", "inboundTag": ["from-iran-de"], "port": 53, "outboundTag": "dns-de" },
+      { "type": "field", "inboundTag": ["from-iran-nl"], "port": 53, "outboundTag": "dns-nl" },
+      { "type": "field", "inboundTag": ["from-iran-us"], "port": 53, "outboundTag": "dns-us" }
+    ]
+  },
+
+  "policy": {
+    "levels": { "0": { "handshake": 3, "connIdle": 180 } }
+  }
+}

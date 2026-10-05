@@ -2,7 +2,7 @@
 
 ## ۱. بدنه کامل کتابخانه محاسباتی منحنی باندینگ
 
-سورس کد اصلی در مسیر `contracts/libraries/PonsV2BondingCurveMath.sol` قرار دارد. از آنجا که کد به صورت مستقیم در چانک‌های API پخش شده و فایل‌بندی آن به صورت یکپارچه نیست، فرمول‌های اصلی از نحوه فراخوانی در قرارداد منحنی باندینگ قابل استخراج هستند:
+سورس کد اصلی در مسیر `contracts/libraries/BondingCurveMath.sol` قرار دارد. از آنجا که کد به صورت مستقیم در چانک‌های API پخش شده و فایل‌بندی آن به صورت یکپارچه نیست، فرمول‌های اصلی از نحوه فراخوانی در قرارداد منحنی باندینگ قابل استخراج هستند:
 
 ### فرمول‌های استفاده‌شده در کد:
 
@@ -332,7 +332,7 @@ function _setCreatorFeeRecipient(address token, LaunchedToken storage launch, ad
     if (launch.phase == GraduationPhase.PoolCreated) {
         memeHook.setCreatorFeeRecipient(_poolIdFor(token, launch), newRecipient);
     } else {
-        PonsV2BondingCurve(launch.curve).setCreatorFeeRecipient(newRecipient);
+        BondingCurve(launch.curve).setCreatorFeeRecipient(newRecipient);
     }
 
     // به‌روزرسانی دریافت‌کننده بازخرید
